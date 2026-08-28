@@ -101,6 +101,10 @@ if exist "dist\GFH_Audit_Automation.exe" (
 ) else (
     echo    WARNING: dist\GFH_Audit_Automation.exe not found
 )
+:: Refresh the Windows Explorer icon cache so the freshly stamped exe
+:: icons appear immediately (Windows keeps showing stale/blank icons
+:: for a rebuilt exe at the same path until the cache is refreshed).
+ie4uinit.exe -show >nul 2>&1
 
 echo.
 echo  ============================================================
@@ -114,6 +118,11 @@ echo      the persistent profile C:\GFH_Edge_Automation_Profile.
 echo    - Scan the WhatsApp Web QR once in that Edge window; it stays
 echo      logged in across runs.
 echo    - Tesseract OCR + Ghostscript enable the OCR photo matching.
+echo    - If the exe icon still looks blank/old in File Explorer,
+echo      that is the Windows icon cache, not a missing icon. Fix:
+echo      run "ie4uinit.exe -show", or rename the exe once (new
+echo      path = fresh icon), or restart Explorer. Right-click the
+echo      exe ^> Properties to see the real embedded GFH icon.
 echo.
 pause
 endlocal
