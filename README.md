@@ -10,10 +10,13 @@ icon is branded too). The title bar shows
 `GFH Telecom LLC Inventory Audit - Timesheet Edition v1.1.0` so you can
 confirm you are running the new build.
 
-**Run `GFH_Audit_Automation.exe`** — it is the one with the branding *and*
+**Run `GFH_Audit_Automation_v1.1.0.exe`** — it is the one with the branding *and*
 the VidaPay-style runtime: START button → WhatsApp unread-badge notification
 polling → BeautifulSoup conversation parsing → OCR images for IMEIs with
-duplicate-scan elimination, over Edge debug port 9226.
+duplicate-scan elimination, over Edge debug port 9226. The build bat names
+the exe with the app version (`GFH_Audit_Automation_v<version>.exe`) and
+deletes older copies, so every build is a fresh file — Windows can never
+show you a stale icon for it.
 
 `GFH_Inventory_Audit_Timesheet.exe` remains the untouched original
 (byte-for-byte) with its classic behaviour.
@@ -230,4 +233,12 @@ or rename the exe once (a new path gets a fresh icon), or restart Explorer
 right-click the exe → **Properties** — the dialog shows the embedded GFH icon.
 
 `build_GFH_Audit_Automation.bat` now runs `ie4uinit.exe -show` automatically
-after copying the exes.
+after copying the exes, forces a shell icon rebuild
+(`SHChangeNotify(SHCNE_ASSOCCHANGED)`), and **verifies the icon is really
+embedded** by extracting it from the built exe (`Icon check: GFH icon
+embedded OK` in the build output).
+
+**Guaranteed fix:** the bat ships the exe as
+`GFH_Audit_Automation_v<version>.exe` — a fresh filename on every build, so
+Explorer has no cached icon to fall back on. If you keep a desktop shortcut,
+recreate it after a version bump (shortcuts cache icons independently).
