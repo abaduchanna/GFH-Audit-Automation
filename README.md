@@ -1,5 +1,29 @@
 # GFH Audit Automation
 
+## Original app — exact copy (with all branding)
+
+The untouched original **`GFH_Inventory_Audit_Timesheet.py`** lives at the
+repo root, byte-for-byte identical to the source file (logos, icons, themes,
+splash screen, stores.json all included):
+
+- `GFH_Inventory_Audit_Timesheet.py` — the original Timesheet Edition app
+- `logo_handler.py`, `theme_manager.py`, `header_manager.py` — its branding modules
+- `GFH_Telecom_Logo.png`, `gfh_icon.ico`, `stores.json`, `assets/` — logos, window/taskbar icons, embedded base64 assets
+- `GFH_Inventory_Audit_Timesheet.spec` — its original PyInstaller recipe → `GFH_Inventory_Audit_Timesheet.exe` (icon: `gfh_icon.ico`)
+
+Run it exactly as before:
+
+```bash
+python GFH_Inventory_Audit_Timesheet.py
+```
+
+`build_GFH_Audit_Automation.bat` builds **both** executables: the original
+branded app first, then the refactored modular app below.
+
+---
+
+## Refactored modular app
+
 Refactored successor of the **GFH Telecom LLC Inventory Audit v27** desktop app.
 All WhatsApp Desktop / OS-level UI automation (pyautogui, pywin32, clipboard
 pasting, `whatsapp:` URIs) has been **completely removed** — messaging now runs
