@@ -28,6 +28,8 @@ datas += collect_data_files("selenium")
 hiddenimports = collect_submodules("gfh_audit")  # lazy imports in scrapers/engine
 hiddenimports += [
     "PIL._tkinter_finder",
+    "bs4",
+    "soupsieve",
     "pytesseract",
     "openpyxl",
     "selenium",

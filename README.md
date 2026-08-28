@@ -12,7 +12,7 @@ the QR code is scanned only once.
 |---|---|
 | **WhatsApp Web (Selenium)** | Attaches to your **real Edge window on debug port 9226** (persistent automation profile, extensions visible, window stays open) — group open, text/image send, real `@mention` dropdown selection with `@phone` fallback, continuous message polling |
 | **OCR pipeline** | Tesseract OCR + Ghostscript (PDF→PNG) + Pillow preprocessing; extracts 15-digit IMEIs (tolerates OCR-space splits, trailing-12-digit partial matches) |
-| **Real-time clearing** | Incoming group photos are OCR'd automatically; matched IMEIs are marked **Cleared** in the audit tracker and a ✅ confirmation is posted to the group |
+| **Real-time clearing** | Monitor reads WhatsApp **unread badges** (VidaPay pattern — only opens groups that actually have new messages), parses conversations once per cycle with **BeautifulSoup**, OCRs new images for 15-digit IMEIs, and marks matches **Cleared** with a group confirmation. A persistent processed-image registry makes IMEI scanning **deduplicated** (never re-OCR the same photo, survives restarts) |
 | **Portal extraction** | Timesheet (`https://gfh-telecom-app.web.app/timesheet`) and BRS count sheet (`https://wsreports.b2bsoft.com/?platform=brs&performanceapp=0#`) auto-login + download/scrape per district |
 | **Employee linking** | `Inventory Audit Status` rep names → `Employee` tab phones → `@phone` tags in every kickoff/variance/reminder message |
 | **District scheduling** | Per-district **Audit Start Time** (HH:MM) configured in the UI; the engine queues districts and fires each workflow exactly at its scheduled time |
@@ -85,6 +85,21 @@ Edge window** through remote debugging:
 
 Tune it in **Portal Credentials → Reminders & engine**: attach on/off, debug
 port, and the automation profile directory.
+
+### How the monitor runs (after pressing START)
+
+1. **START button** starts the engine: scheduler + a continuous monitor loop.
+2. Each cycle the monitor reads the WhatsApp Web **notification badges**
+   (green unread circles in the chat list, exactly like the VidaPay Transfer
+   Bot). WhatsApp notification settings are switched ON automatically once
+   per session.
+3. Only groups with unread messages are opened; the conversation HTML is
+   fetched once and parsed with **BeautifulSoup** (Selenium DOM fallback).
+4. New images are downloaded, preprocessed, and OCR'd for 15-digit IMEIs;
+   every processed message is recorded in a `processed_images` registry so
+   **the same photo/IMEI is never scanned twice** (across restarts too).
+5. Matched IMEIs clear their variances and a confirmation is posted to the
+   group; unmatched photos are logged once and skipped afterwards.
 
 ## Configuration
 

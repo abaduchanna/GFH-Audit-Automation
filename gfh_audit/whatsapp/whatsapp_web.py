@@ -22,6 +22,15 @@ from .driver_manager import DriverManager
 
 logger = logging.getLogger("gfh.audit.whatsapp.web")
 
+# BeautifulSoup for fast HTML parsing of WhatsApp Web pages: one page_source
+# fetch parsed locally beats N Selenium DOM round-trips (VidaPay pattern).
+try:
+    from bs4 import BeautifulSoup
+
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
 WHATSAPP_URL = "https://web.whatsapp.com"
 
 # --- resilient selectors (WhatsApp Web changes markup frequently) -----------
@@ -91,6 +100,7 @@ class WhatsAppWeb:
         self.dm = driver_manager
         self.status_callback = status_callback
         self._seen_message_ids: dict = {}  # group -> set(message ids)
+        self._notif_checked = False        # WhatsApp notification settings checked once per session
 
     # -- helpers ---------------------------------------------------------------
     def _notify(self, text: str) -> None:
@@ -388,12 +398,261 @@ class WhatsAppWeb:
         return False
 
     # -- polling ------------------------------------------------------------------------
-    def fetch_new_messages(self, group_name: str, limit: int = 12) -> List[WhatsAppMessage]:
-        """Read the most recent messages in the currently open group.
+    # -- notification-driven monitoring (VidaPay Transfer Bot pattern) ---------
+    def check_group_notifications(self) -> List[str]:
+        """Return the names of chats/groups that currently show an unread badge.
 
-        Only messages whose data-id was not observed before are returned."""
+        Reads the WhatsApp Web chat list directly in the browser (green unread
+        badge circles, aria-label fallback) instead of opening every group.
+        The monitor uses this to only open groups that actually have new
+        messages."""
+        self._ensure_notification_settings_on()
+        try:
+            unread = self.driver.execute_script("""
+                const groupsWithUnread = [];
+
+                // Strategy 1: spans containing small numbers inside elements
+                // with a green background (the unread badge circle).
+                const allSpans = document.querySelectorAll('span');
+                for (const span of allSpans) {
+                    if (span.offsetWidth === 0 || span.offsetHeight === 0) continue;
+                    const text = span.textContent.trim();
+                    if (!text || !/^\\d{1,2}$/.test(text)) continue;
+                    let el = span;
+                    for (let i = 0; i < 3 && el; i++) {
+                        const bg = getComputedStyle(el).backgroundColor;
+                        if (bg && bg !== 'rgba(0, 0, 0, 0)' && bg !== 'rgb(0, 0, 0)'
+                            && bg !== 'rgb(255, 255, 255)' && bg !== 'transparent') {
+                            const match = bg.match(/\\d+/g);
+                            if (match && match.length >= 3) {
+                                const r = parseInt(match[0]);
+                                const g = parseInt(match[1]);
+                                const b = parseInt(match[2]);
+                                if (g > r && g > b) {
+                                    let parent = el.parentElement;
+                                    let group_name = '';
+                                    for (let j = 0; j < 15 && parent; j++) {
+                                        const nameEl = parent.querySelector(
+                                            'span[title], span[aria-label], '
+                                          + 'div[title], div[aria-label]'
+                                        );
+                                        if (nameEl) {
+                                            group_name = nameEl.getAttribute('title')
+                                                || nameEl.getAttribute('aria-label')
+                                                || nameEl.textContent || '';
+                                            if (group_name.trim() && group_name.length > 1) break;
+                                        }
+                                        parent = parent.parentElement;
+                                    }
+                                    if (group_name.trim()) {
+                                        groupsWithUnread.push(group_name.trim());
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        el = el.parentElement;
+                    }
+                }
+
+                // Strategy 2: fallback - aria-label containing "unread".
+                const ariaUnread = document.querySelectorAll(
+                    '[aria-label*="unread" i], [aria-label*="message" i]'
+                );
+                for (const el of ariaUnread) {
+                    if (el.offsetWidth === 0 || el.offsetHeight === 0) continue;
+                    const label = el.getAttribute('aria-label') || '';
+                    if (label.toLowerCase().includes('unread')) {
+                        let parent = el.parentElement;
+                        for (let j = 0; j < 10 && parent; j++) {
+                            const nameEl = parent.querySelector('span[title], div[title]');
+                            if (nameEl && nameEl.getAttribute('title')) {
+                                groupsWithUnread.push(nameEl.getAttribute('title').trim());
+                                break;
+                            }
+                            parent = parent.parentElement;
+                        }
+                    }
+                }
+
+                return [...new Set(groupsWithUnread)];
+            """)
+            return list(unread or [])
+        except Exception as exc:
+            logger.debug("Notification check error: %s", exc)
+            return []
+
+    def _ensure_notification_settings_on(self) -> None:
+        """Turn WhatsApp Web notification settings ON (once per session)."""
+        if self._notif_checked:
+            return
+        self._notif_checked = True
+        try:
+            settings_clicked = False
+            for selector in [
+                'span[data-testid="menu"]',
+                'div[aria-label="Menu"]',
+                'button[aria-label="Menu"]',
+                'span[aria-label="Settings"]',
+                'div[role="button"][aria-label*="Menu"]',
+                '#side > header div[role="button"]',
+            ]:
+                try:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if btn.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(1)
+                        settings_clicked = True
+                        break
+                except Exception:
+                    continue
+            if not settings_clicked:
+                return
+            for selector in [
+                'li[role="menuitem"] div[title="Settings"]',
+                'div[role="menuitem"][title="Settings"]',
+                'li span[title="Settings"]',
+                'div[aria-label="Settings"]',
+            ]:
+                try:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if btn.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(1)
+                        break
+                except Exception:
+                    continue
+            for selector in [
+                'div[role="listitem"] span[title="Notifications"]',
+                'div[role="listitem"] div[title="Notifications"]',
+                'span[title="Notifications"]',
+                'div[aria-label="Notifications"]',
+            ]:
+                try:
+                    btn = self.driver.find_element(By.CSS_SELECTOR, selector)
+                    if btn.is_displayed():
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(1)
+                        break
+                except Exception:
+                    continue
+            toggles = self.driver.find_elements(
+                By.CSS_SELECTOR,
+                'div[role="checkbox"], span[role="button"][aria-checked], '
+                'input[type="checkbox"], div[role="switch"]'
+            )
+            turned_on = 0
+            for toggle in toggles:
+                try:
+                    if not toggle.is_displayed():
+                        continue
+                    checked = toggle.get_attribute("aria-checked")
+                    is_selected = toggle.is_selected()
+                    if checked == "false" or (checked is None and not is_selected):
+                        self.driver.execute_script("arguments[0].click();", toggle)
+                        time.sleep(0.5)
+                        turned_on += 1
+                except Exception:
+                    continue
+            if turned_on:
+                self._notify(f"Turned ON {turned_on} WhatsApp notification setting(s)")
+            # navigate back to the chats view
+            try:
+                self.driver.back()
+                time.sleep(1)
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.debug("Notification settings check failed: %s", exc)
+
+    def fetch_new_messages(self, group_name: str, limit: int = 12) -> List[WhatsAppMessage]:
+        """Read the most recent incoming messages of the currently open group.
+
+        Primary path parses ``driver.page_source`` once with BeautifulSoup
+        (fast); falls back to Selenium DOM traversal. Only messages whose
+        data-id was not observed before are returned (duplicate scanning of
+        images/IMEIs is prevented here)."""
         if not self.is_logged_in():
             return []
+        raw = self._extract_messages_bs4(group_name, limit)
+        if raw is None:
+            raw = self._extract_messages_selenium(group_name, limit)
+
+        seen = self._seen_message_ids.setdefault(group_name, set())
+        messages: List[WhatsAppMessage] = []
+        for message in raw:
+            if not message.message_id or message.message_id in seen:
+                continue
+            seen.add(message.message_id)
+            if len(seen) > 500:
+                newest_ids = {m.message_id for m in raw}
+                self._seen_message_ids[group_name] = {
+                    i for i in seen if i in newest_ids
+                } | {message.message_id}
+                seen = self._seen_message_ids[group_name]
+            messages.append(message)
+        return messages
+
+    def _extract_messages_bs4(self, group_name: str, limit: int) -> Optional[List[WhatsAppMessage]]:
+        """Parse the visible conversation with BeautifulSoup.
+
+        Returns None when BeautifulSoup is unavailable or parsing fails so the
+        caller can fall back to Selenium extraction."""
+        if not BS4_AVAILABLE:
+            return None
+        try:
+            html = self.driver.page_source
+        except Exception:
+            return None
+        if not html:
+            return None
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            rows = soup.select("div[data-id]")
+            if not rows:
+                rows = soup.select("div[role='row']")
+            if not rows:
+                return None
+            messages: List[WhatsAppMessage] = []
+            for row in rows[-max(limit * 3, limit):]:
+                try:
+                    row_class = " ".join(row.get("class") or [])
+                    if "message-in" not in row_class:
+                        continue
+                    msg_id = row.get("data-id") or ""
+                    if not msg_id:
+                        continue
+                    text_nodes = row.select("span.selectable-text")
+                    text = "\n".join(
+                        node.get_text("\n", strip=True)
+                        for node in text_nodes
+                        if node.get_text(strip=True)
+                    )
+                    sender = ""
+                    sender_node = row.select_one("span[aria-label], span[class*='sender']")
+                    if sender_node:
+                        sender = sender_node.get("aria-label") or sender_node.get_text(strip=True)
+                    has_image = bool(row.select("img[src^='blob:']"))
+                    if not text and not has_image:
+                        continue
+                    messages.append(
+                        WhatsAppMessage(
+                            message_id=msg_id,
+                            group=group_name,
+                            sender=sender,
+                            text=text,
+                            has_image=has_image,
+                        )
+                    )
+                except Exception:
+                    continue
+            return messages[-limit:]
+        except Exception as exc:
+            logger.debug("BS4 message extraction failed: %s", exc)
+            return None
+
+    def _extract_messages_selenium(self, group_name: str, limit: int) -> List[WhatsAppMessage]:
+        """Selenium fallback: walk message rows via WebDriver round-trips."""
         messages: List[WhatsAppMessage] = []
         try:
             elements = self.driver.find_elements(
@@ -403,27 +662,11 @@ class WhatsAppWeb:
                 elements = self.driver.find_elements(
                     By.XPATH, "//div[contains(@class,'message-in')][@data-id]"
                 )
-            seen = self._seen_message_ids.setdefault(group_name, set())
             for element in elements[-limit:]:
                 try:
                     msg_id = element.get_attribute("data-id") or ""
-                    if not msg_id or msg_id in seen:
+                    if not msg_id:
                         continue
-                    seen.add(msg_id)
-                    if len(seen) > 500:
-                        # keep the set bounded
-                        newest = elements[-limit:]
-                        newest_ids = set()
-                        for el in newest:
-                            try:
-                                newest_ids.add(el.get_attribute("data-id") or "")
-                            except Exception:
-                                pass
-                        self._seen_message_ids[group_name] = {
-                            i for i in seen if i in newest_ids
-                        }
-                        seen = self._seen_message_ids[group_name]
-
                     sender, text = self._extract_sender_and_text(element)
                     has_image = bool(element.find_elements(By.CSS_SELECTOR, "img[src^='blob:']"))
                     messages.append(
@@ -483,6 +726,16 @@ class WhatsAppWeb:
     def _collect_blob_urls(self, message: WhatsAppMessage) -> List[str]:
         urls: List[str] = []
         element = message.element_ref
+        if element is None and message.message_id:
+            # BS4-extracted messages carry no live element — re-locate it by
+            # its data-id before touching blob URLs.
+            try:
+                element = self.driver.find_element(
+                    By.XPATH, f"//div[@data-id=\"{message.message_id}\"]"
+                )
+                message.element_ref = element
+            except Exception:
+                return urls
         try:
             if element is not None:
                 thumbs = element.find_elements(By.CSS_SELECTOR, "img[src^='blob:']")
