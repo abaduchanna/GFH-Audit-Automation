@@ -213,3 +213,21 @@ Edge window it attaches to uses the dedicated profile
 `C:\GFH_Edge_Automation_Profile` (WhatsApp QR scan + portal logins persist
 there). For OCR photo matching, Tesseract OCR + Ghostscript must be installed
 on the machine (both auto-detected at runtime).
+
+## Troubleshooting — exe icon blank/old in File Explorer?
+
+The GFH icon **is embedded** in both exes (`gfh_icon.ico`, 16–256 px frames;
+`GFH_Audit_Automation.spec` sets `icon=` and the app also sets the
+window/taskbar icon at runtime). If File Explorer still shows a blank or old
+icon after a rebuild, that is the **Windows shell icon cache**, not a missing
+icon. Any one of these fixes it:
+
+```bat
+ie4uinit.exe -show
+```
+or rename the exe once (a new path gets a fresh icon), or restart Explorer
+(Task Manager → Windows Explorer → Restart). To verify the real icon,
+right-click the exe → **Properties** — the dialog shows the embedded GFH icon.
+
+`build_GFH_Audit_Automation.bat` now runs `ie4uinit.exe -show` automatically
+after copying the exes.
