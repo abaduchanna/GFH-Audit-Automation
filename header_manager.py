@@ -152,6 +152,8 @@ class FixedHeaderManager:
 
     def add_copyright(self, theme_manager):
         """Build a pinned footer bar (dark navy, never theme-changes) with centered copyright text."""
+        import tkinter as tk  # lazy import — was missing and crashed the frozen exe (NameError: tk)
+
         copyright_text = theme_manager.get_copyright_text()
 
         # Footer bar pinned to bottom of the PARENT window — not inside the header frame
