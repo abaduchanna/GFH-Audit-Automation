@@ -12,6 +12,15 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# BeautifulSoup for fast HTML parsing: one page_source fetch parsed locally
+# instead of hundreds of Selenium DOM round-trips (VidaPay pattern).
+try:
+    from bs4 import BeautifulSoup
+
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+
 logger = logging.getLogger("gfh.audit.scrapers")
 
 
@@ -125,7 +134,53 @@ class PortalScraper(ABC):
     TABLE_ROW_SELECTOR = "table tr, [role='row']"
 
     def scrape_tables_as_records(self, min_rows: int = 1) -> List[dict]:
-        """Read visible HTML tables into list-of-dict records (header → key)."""
+        """Read visible HTML tables into list-of-dict records (header → key).
+
+        Primary path fetches ``driver.page_source`` once and parses it with
+        BeautifulSoup; falls back to Selenium DOM traversal when bs4 is not
+        installed or parsing yields nothing."""
+        if BS4_AVAILABLE:
+            try:
+                html = self.dm.driver.page_source
+                if html:
+                    records = self._parse_tables_bs4(html, min_rows)
+                    if records:
+                        return records
+            except Exception as exc:
+                self.log(f"BS4 table scraping warning: {exc}")
+        return self._scrape_tables_selenium(min_rows)
+
+    @staticmethod
+    def _parse_tables_bs4(html: str, min_rows: int = 1) -> List[dict]:
+        soup = BeautifulSoup(html, "html.parser")
+        records: List[dict] = []
+        tables = soup.select("table")
+        if not tables:
+            # role=grid/list tables used by some React portals
+            tables = soup.select("div[role='table'], div[role='grid']")
+        for table in tables:
+            rows = table.select("tr")
+            if not rows or len(rows) - 1 < min_rows:
+                continue
+            headers = [
+                (cell.get_text(strip=True) or "Column")
+                for cell in rows[0].select("th, td")
+            ]
+            if not headers:
+                continue
+            for row in rows[1:]:
+                cells = row.select("td")
+                if not cells:
+                    continue
+                record = {}
+                for i, cell in enumerate(cells):
+                    key = headers[i] if i < len(headers) else f"Column{i + 1}"
+                    record[key] = cell.get_text(strip=True)
+                if any(str(v).strip() for v in record.values()):
+                    records.append(record)
+        return records
+
+    def _scrape_tables_selenium(self, min_rows: int = 1) -> List[dict]:
         records: List[dict] = []
         try:
             tables = self.dm.driver.find_elements(By.CSS_SELECTOR, "table")

@@ -107,6 +107,13 @@ class VarianceDatabase:
                         ts TEXT, district TEXT, event TEXT, detail TEXT
                    )"""
             )
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS processed_images (
+                        message_id TEXT PRIMARY KEY,
+                        district TEXT, group_name TEXT,
+                        imeis TEXT, processed_at TEXT
+                   )"""
+            )
             for table, columns in (
                 ("variances", {"cleared_via"}),
                 ("district_runs", {"last_message", "total_variances", "cleared_variances"}),
@@ -464,6 +471,48 @@ class VarianceDatabase:
             con.execute(
                 "INSERT INTO audit_events (ts, district, event, detail) VALUES (?,?,?,?)",
                 (now_text(), district, event, detail[:2000]),
+            )
+            con.commit()
+
+    # -- processed image registry (prevents duplicate IMEI scanning) ----------
+    def is_message_processed(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+        with self._lock, self.connect() as con:
+            row = con.execute(
+                "SELECT 1 FROM processed_images WHERE message_id = ?", (message_id,)
+            ).fetchone()
+            return bool(row)
+
+    def mark_message_processed(
+        self,
+        message_id: str,
+        district: str = "",
+        group_name: str = "",
+        imeis: Optional[List[str]] = None,
+    ) -> None:
+        if not message_id:
+            return
+        with self._lock, self.connect() as con:
+            con.execute(
+                """INSERT OR REPLACE INTO processed_images
+                   (message_id, district, group_name, imeis, processed_at)
+                   VALUES (?,?,?,?,?)""",
+                (message_id, district, group_name,
+                 ",".join(imeis or []), now_text()),
+            )
+            con.commit()
+        self.prune_processed_images()
+
+    def prune_processed_images(self, keep: int = 5000) -> None:
+        """Keep the registry bounded - newest entries (by insertion) win."""
+        with self._lock, self.connect() as con:
+            con.execute(
+                """DELETE FROM processed_images WHERE rowid NOT IN (
+                       SELECT rowid FROM processed_images
+                       ORDER BY rowid DESC LIMIT ?
+                   )""",
+                (keep,),
             )
             con.commit()
 

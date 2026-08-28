@@ -73,12 +73,42 @@ class WhatsAppMonitor:
             self._stop_event.wait(self.poll_interval)
 
     def _poll_once(self) -> None:
-        for district, group in self._active_groups():
+        active = self._active_groups()
+        if not active:
+            return
+        targets = self._select_target_groups(dict(active))
+        for district, group in targets:
             if self._stop_event.is_set():
                 return
+            if not self.whatsapp.open_group(group, wait_seconds=15):
+                logger.debug("Could not open group %s - skipping this cycle", group)
+                continue
             messages = self.whatsapp.fetch_new_messages(group)
             for message in messages:
                 self._process_message(district, group, message)
+
+    def _select_target_groups(self, active: Dict[str, str]) -> List[tuple]:
+        """VidaPay pattern: read the WhatsApp unread badges first and only
+        open groups that actually have new messages. Falls back to scanning
+        every active group when the badge check is unavailable."""
+        try:
+            unread = self.whatsapp.check_group_notifications()
+        except Exception as exc:
+            logger.debug("Badge check unavailable: %s", exc)
+            unread = None
+        if unread is None:
+            return list(active.items())
+        if not unread:
+            return []
+        unread_set = {name.strip().lower() for name in unread}
+        targets = [
+            (district, group)
+            for district, group in active.items()
+            if group.strip().lower() in unread_set
+        ]
+        if targets:
+            logger.info("Unread badges in: %s", [g for _, g in targets])
+        return targets
 
     # -- group registry ---------------------------------------------------------------
     def _active_groups(self) -> List[tuple]:
@@ -103,13 +133,19 @@ class WhatsAppMonitor:
 
     def _process_image_message(self, district: str, group: str, message: WhatsAppMessage) -> None:
         sender = message.sender or "unknown"
+
+        # --- duplicate-scan guard: never OCR the same image/message twice ---
+        if message.message_id and self.db.is_message_processed(message.message_id):
+            logger.debug("Skipping already-processed message %s", message.message_id)
+            return
+
         logger.info("Image message in %s from %s — running OCR", group, sender)
         try:
             data = self.whatsapp.download_message_image(message)
             if not data:
                 self._emit(MonitorEvent(kind="ocr_miss", district=district, group=group,
                                         detail=f"Could not download image from {sender}"))
-                return
+                return  # not marked processed - retried while still visible
 
             # keep a copy for audit purposes
             stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -131,13 +167,20 @@ class WhatsAppMonitor:
                                         detail=f"OCR error: {result.error}"))
                 return
 
+            # processed successfully (match or clean miss) - record it so the
+            # same image is never downloaded/OCR'd again (survives restarts)
+            self.db.mark_message_processed(message.message_id, district, group,
+                                           result.imeis)
+
             pending = self.db.rows(include_cleared=False, district=district)
             if not pending:
                 pending = self.db.rows(include_cleared=False)
 
             cleared_any = False
             matched_desc: List[str] = []
-            for imei in result.imeis:
+            for imei in dict.fromkeys(result.imeis):  # dedupe, order preserved
+                if not imei:
+                    continue
                 matches = match_imei_against_variances(imei, pending)
                 for row in matches:
                     keys = self.db.clear_by_imei(row.imei, district=district or "", via="ocr")
