@@ -10,7 +10,7 @@ the QR code is scanned only once.
 
 | Area | What it does |
 |---|---|
-| **WhatsApp Web (Selenium)** | Persistent Chrome/Edge profile (`whatsapp_web_profile/`), group open, text/image send, real `@mention` dropdown selection with `@phone` fallback, continuous message polling |
+| **WhatsApp Web (Selenium)** | Attaches to your **real Edge window on debug port 9226** (persistent automation profile, extensions visible, window stays open) — group open, text/image send, real `@mention` dropdown selection with `@phone` fallback, continuous message polling |
 | **OCR pipeline** | Tesseract OCR + Ghostscript (PDF→PNG) + Pillow preprocessing; extracts 15-digit IMEIs (tolerates OCR-space splits, trailing-12-digit partial matches) |
 | **Real-time clearing** | Incoming group photos are OCR'd automatically; matched IMEIs are marked **Cleared** in the audit tracker and a ✅ confirmation is posted to the group |
 | **Portal extraction** | Timesheet (`https://gfh-telecom-app.web.app/timesheet`) and BRS count sheet (`https://wsreports.b2bsoft.com/?platform=brs&performanceapp=0#`) auto-login + download/scrape per district |
@@ -65,9 +65,26 @@ it simply cannot OCR photos/PDFs.
 
 ### First WhatsApp Web login
 
-Press **START** → the automated browser opens `web.whatsapp.com` → scan the QR
-code **once**. The session persists in the profile directory; subsequent runs
-log in automatically.
+Press **START** → the app opens (or attaches to) the automation Edge window on
+debug port **9226** → navigate to `web.whatsapp.com` and scan the QR code
+**once**. The session persists in the automation profile
+(`C:\GFH_Edge_Automation_Profile`); subsequent runs attach to the same window
+and log in automatically — identical to the VidaPay Transfer Bot behaviour.
+
+### Edge attach mode (port 9226)
+
+The bot never launches a private throwaway browser: it drives your **real
+Edge window** through remote debugging:
+
+- If Edge is not yet running on port `9226`, the app starts it with the
+  persistent automation profile and waits for the DevTools port.
+- Selenium then attaches via `debuggerAddress=127.0.0.1:9226`, reuses the
+  open tabs, keeps extensions visible, and leaves the window open on exit.
+- Portal downloads are seeded into the profile so exports land in
+  `portal_downloads/` even in attach mode.
+
+Tune it in **Portal Credentials → Reminders & engine**: attach on/off, debug
+port, and the automation profile directory.
 
 ## Configuration
 
@@ -121,28 +138,21 @@ python -m unittest discover -s tests -v
 
 ## Build the Windows EXE (one-click)
 
-Run **`build_exe.bat`** (double-click it, or execute it from a terminal). On
-every run it:
+Run **`build_GFH_Audit_Automation.bat`** (double-click it, or execute it from
+a terminal). On every run it:
 
-1. Verifies Git and Python 3.10+ are on `PATH` (with install links if missing)
-2. Clones this repo to `%USERPROFILE%\GFH-Audit-Automation` — or `git pull`s
-   the latest code if the folder already exists (hard-reset fallback keeps it
-   always in sync)
-3. Creates/updates a `.venv`, installs `requirements.txt` + PyInstaller
-4. Warns about optional runtime tools (Tesseract, Ghostscript, Chrome)
-5. Rebuilds `dist\GFHAuditAutomation.exe` from scratch with the committed
-   `gfh_audit.spec` (single-file, windowed)
-6. Saves a dated copy to `releases\GFHAuditAutomation_YYYYMMDD_HHMMSS.exe`
+1. Verifies Python, PyInstaller (auto-installs) and Git are on `PATH`
+2. Clones this repo to `C:\Users\AbadUmairChanna\Downloads\GitHub\GFH-Audit-Automation`
+   — or `git pull`s the latest code if it already exists
+3. Cleans `build/` / `dist/` / `__pycache__`, redirects the PyInstaller
+   workpath to `%TEMP%\pyi_build\GFH_Audit_Automation`
+4. Installs `requirements.txt`
+5. Builds with the committed `GFH_Audit_Automation.spec` (single-file, windowed)
+6. Copies the result to `C:\Users\AbadUmairChanna\Downloads\GitHub\GFH_Audit_Automation.exe`
 
-Override the workspace folder or source repo before running:
-
-```bat
-set GFH_WORKDIR=D:\GFH-Audit-Automation
-set GFH_REPO_URL=https://github.com/you/your-fork.git
-build_exe.bat
-```
-
-The produced EXE is portable: its data files (SQLite DB, WhatsApp profile,
-logs, config) are created **next to the exe** on first launch. The machine
-that runs it still needs Google Chrome, and — for OCR photo matching —
-Tesseract OCR + Ghostscript (both auto-detected, links in the warnings).
+The produced EXE is portable: its data files (SQLite DB, logs, config,
+`portal_downloads/`) are created **next to the exe** on first launch. The
+Edge window it attaches to uses the dedicated profile
+`C:\GFH_Edge_Automation_Profile` (WhatsApp QR scan + portal logins persist
+there). For OCR photo matching, Tesseract OCR + Ghostscript must be installed
+on the machine (both auto-detected at runtime).

@@ -85,7 +85,12 @@ class AppConfig:
     schedule: Dict[str, DistrictScheduleEntry] = field(default_factory=dict)
     tesseract_path: str = ""
     ghostscript_path: str = ""
-    whatsapp_browser: str = "chrome"            # "chrome" | "edge"
+    whatsapp_browser: str = "edge"               # "chrome" | "edge"
+    # Edge attach mode (VidaPay Transfer Bot pattern): a real Edge window is
+    # launched with --remote-debugging-port and Selenium attaches to it.
+    edge_attach: bool = True
+    edge_debug_port: int = 9226
+    edge_profile_dir: str = r"C:\GFH_Edge_Automation_Profile"
 
     # -- serialisation ------------------------------------------------------
     def to_dict(self) -> dict:
@@ -140,7 +145,13 @@ class AppConfig:
 
         cfg.tesseract_path = str((data or {}).get("tesseract_path", "") or "")
         cfg.ghostscript_path = str((data or {}).get("ghostscript_path", "") or "")
-        cfg.whatsapp_browser = str((data or {}).get("whatsapp_browser", "chrome") or "chrome")
+        cfg.whatsapp_browser = str((data or {}).get("whatsapp_browser", "edge") or "edge")
+        cfg.edge_attach = bool((data or {}).get("edge_attach", True))
+        try:
+            cfg.edge_debug_port = int((data or {}).get("edge_debug_port", 9226) or 9226)
+        except (TypeError, ValueError):
+            cfg.edge_debug_port = 9226
+        cfg.edge_profile_dir = str((data or {}).get("edge_profile_dir", "") or r"C:\GFH_Edge_Automation_Profile")
         return cfg
 
 

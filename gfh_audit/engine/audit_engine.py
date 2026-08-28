@@ -131,6 +131,10 @@ class AuditEngine:
             profile_dir=WHATSAPP_PROFILE_DIR,
             browser=self.config.whatsapp_browser,
             headless=False,  # WhatsApp Web QR/first login needs a visible window
+            attach=self.config.edge_attach,
+            debug_port=self.config.edge_debug_port,
+            edge_profile_dir=self.config.edge_profile_dir,
+            download_dir=DOWNLOAD_DIR,
         )
         if not self.dm.initialize():
             raise RuntimeError("Browser driver could not be initialised")

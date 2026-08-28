@@ -5,7 +5,7 @@ Produces a single-file, windowed (no console) executable:
 
     pyinstaller --noconfirm --clean gfh_audit.spec
 
-Output:  dist/GFHAuditAutomation.exe
+Output:  dist/GFH_Audit_Automation.exe
 
 Notes
 -----
@@ -60,7 +60,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="GFHAuditAutomation",
+    name="GFH_Audit_Automation",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

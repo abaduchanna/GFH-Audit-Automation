@@ -527,6 +527,9 @@ class GFHAuditApp(tk.Tk):
         self.max_reminders_var = tk.StringVar(value=str(self.config.reminders.max_reminders))
         self.poll_interval_var = tk.StringVar(value=str(self.config.engine.poll_interval_seconds))
         self.browser_var = tk.StringVar(value=self.config.whatsapp_browser)
+        self.edge_attach_var = tk.BooleanVar(value=self.config.edge_attach)
+        self.edge_port_var = tk.StringVar(value=str(self.config.edge_debug_port))
+        self.edge_profile_var = tk.StringVar(value=self.config.edge_profile_dir)
         self.tesseract_var = tk.StringVar(value=self.config.tesseract_path or find_tesseract() or "")
         self.ghostscript_var = tk.StringVar(value=self.config.ghostscript_path or find_ghostscript() or "")
 
@@ -542,6 +545,12 @@ class GFHAuditApp(tk.Tk):
         ttk.Label(rem_frame, text="WhatsApp browser:").grid(row=4, column=0, sticky="w")
         ttk.Combobox(rem_frame, textvariable=self.browser_var, values=["chrome", "edge"],
                      state="readonly", width=8).grid(row=4, column=1, padx=8, sticky="w")
+        ttk.Checkbutton(rem_frame, text="Attach to Edge window on debug port (VidaPay style)",
+                        variable=self.edge_attach_var).grid(row=5, column=0, columnspan=2, sticky="w")
+        ttk.Label(rem_frame, text="Edge debug port:").grid(row=6, column=0, sticky="w")
+        ttk.Entry(rem_frame, textvariable=self.edge_port_var, width=8).grid(row=6, column=1, padx=8, pady=3, sticky="w")
+        ttk.Label(rem_frame, text="Edge automation profile:").grid(row=7, column=0, sticky="w")
+        ttk.Entry(rem_frame, textvariable=self.edge_profile_var, width=44).grid(row=7, column=1, columnspan=2, padx=8, sticky="ew")
         ttk.Label(rem_frame, text="Tesseract path (auto if empty):").grid(row=0, column=3, sticky="w")
         ttk.Entry(rem_frame, textvariable=self.tesseract_var, width=44).grid(row=0, column=4, padx=8, sticky="ew")
         ttk.Label(rem_frame, text="Ghostscript path (auto if empty):").grid(row=1, column=3, sticky="w")
@@ -564,6 +573,12 @@ class GFHAuditApp(tk.Tk):
         except ValueError:
             pass
         cfg.whatsapp_browser = self.browser_var.get()
+        cfg.edge_attach = bool(self.edge_attach_var.get())
+        try:
+            cfg.edge_debug_port = int(self.edge_port_var.get() or 9226)
+        except ValueError:
+            cfg.edge_debug_port = 9226
+        cfg.edge_profile_dir = self.edge_profile_var.get().strip() or r"C:\GFH_Edge_Automation_Profile"
         cfg.tesseract_path = self.tesseract_var.get().strip()
         cfg.ghostscript_path = self.ghostscript_var.get().strip()
         return cfg
@@ -595,6 +610,10 @@ class GFHAuditApp(tk.Tk):
                 dm = DriverManager(
                     profile_dir=WHATSAPP_PROFILE_DIR.parent / "portal_test_profile",
                     browser=self.browser_var.get(), headless=False,
+                    attach=self.edge_attach_var.get(),
+                    debug_port=int(self.edge_port_var.get() or 9226),
+                    edge_profile_dir=self.edge_profile_var.get().strip() or r"C:\GFH_Edge_Automation_Profile",
+                    download_dir=DOWNLOAD_DIR,
                 )
                 if not dm.initialize():
                     raise RuntimeError("Browser init failed")
