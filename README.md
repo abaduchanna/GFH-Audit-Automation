@@ -1,5 +1,23 @@
 # GFH Audit Automation
 
+## v1.1.0 — full GFH branding now built into the modular app
+
+`GFH_Audit_Automation.exe` (the refactored app below) now ships with the
+**same GFH branding as the original**: navy fixed header with the GFH Telecom
+logo and red divider, dark/light theme with the header toggle button, pinned
+copyright footer, and the `gfh_icon.ico` window + taskbar icon (the exe file
+icon is branded too). The title bar shows
+`GFH Telecom LLC Inventory Audit - Timesheet Edition v1.1.0` so you can
+confirm you are running the new build.
+
+**Run `GFH_Audit_Automation.exe`** — it is the one with the branding *and*
+the VidaPay-style runtime: START button → WhatsApp unread-badge notification
+polling → BeautifulSoup conversation parsing → OCR images for IMEIs with
+duplicate-scan elimination, over Edge debug port 9226.
+
+`GFH_Inventory_Audit_Timesheet.exe` remains the untouched original
+(byte-for-byte) with its classic behaviour.
+
 ## Original app — exact copy (with all branding)
 
 The untouched original **`GFH_Inventory_Audit_Timesheet.py`** lives at the

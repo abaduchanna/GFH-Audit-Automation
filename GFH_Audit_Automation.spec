@@ -19,6 +19,9 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files
 datas = [
     # Example config ships with the exe; the live config lives next to the exe.
     ("config/config.example.json", "config"),
+    # GFH branding — navy header logo + window/taskbar icon (same as original)
+    ("GFH_Telecom_Logo.png", "."),
+    ("gfh_icon.ico", "."),
 ]
 
 # Selenium ships the Selenium-Manager binary and remote JS - bundle them so
@@ -33,6 +36,10 @@ hiddenimports += [
     "pytesseract",
     "openpyxl",
     "selenium",
+    # GFH ecosystem branding modules (repo root, imported by gfh_audit.gui.app)
+    "theme_manager",
+    "logo_handler",
+    "header_manager",
 ]
 
 a = Analysis(
@@ -75,5 +82,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,
+    icon="gfh_icon.ico",
 )

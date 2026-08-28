@@ -11,6 +11,7 @@ Tabs:
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -31,15 +32,48 @@ from ..whatsapp.mentions import MentionResolver
 from ..xlsx_reader import read_xlsx_records
 from .widgets import LogConsole, make_treeview, sort_treeview
 
+try:  # GFH ecosystem branding modules (repo root — bundled by the .spec)
+    from theme_manager import ThemeManager
+    from header_manager import FixedHeaderManager
+
+    _BRANDING_AVAILABLE = True
+except Exception:  # pragma: no cover — plain fallback keeps the app usable
+    _BRANDING_AVAILABLE = False
+
 logger = logging.getLogger("gfh.audit.gui")
+
+
+def _resource_path(name: str) -> Optional[Path]:
+    """Locate a bundled asset (source tree and PyInstaller onefile aware)."""
+    candidates: List[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / name)
+    candidates.append(Path(__file__).resolve().parents[2] / name)
+    candidates.append(Path.cwd() / name)
+    for cand in candidates:
+        try:
+            if cand.is_file():
+                return cand
+        except OSError:
+            continue
+    return None
 
 
 class GFHAuditApp(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(f"{APP_TITLE}  v{__version__}")
+        self.title(f"GFH Telecom LLC Inventory Audit - Timesheet Edition  v{__version__}")
         self.geometry("1280x860")
         self.minsize(1100, 720)
+
+        # GFH branding: navy header + logo + dark/light theme + footer copyright
+        if _BRANDING_AVAILABLE:
+            self.theme_manager = ThemeManager("GFH Inventory Audit", app_name="vidapay-gfh")
+            self.theme_manager.current_theme = "dark"  # original app always starts dark
+        else:  # pragma: no cover
+            self.theme_manager = None
+        self._set_window_icon()
 
         ensure_runtime_dirs()
         self.config_store = ConfigStore()
@@ -63,6 +97,56 @@ class GFHAuditApp(tk.Tk):
         self._refresh_status_table()
         self._refresh_variance_table()
         self._refresh_district_runs()
+        if self.theme_manager is not None:
+            self.theme_manager.apply_theme_to_window(self)
+            self._apply_theme_colors()
+
+    # ------------------------------------------------------------------ branding
+    def _set_window_icon(self) -> None:
+        """Window + taskbar icon (gfh_icon.ico), PNG logo fallback."""
+        ico = _resource_path("gfh_icon.ico")
+        if ico is not None:
+            try:
+                # default=... applies to BOTH title bar and taskbar button
+                self.iconbitmap(default=str(ico))
+                self.after(150, lambda: self.iconbitmap(default=str(ico)))
+                return
+            except Exception:
+                pass
+        logo = _resource_path("GFH_Telecom_Logo.png")
+        if logo is not None:
+            try:
+                from PIL import Image, ImageTk
+
+                img = Image.open(logo)
+                img.thumbnail((64, 64))
+                self._icon_photo = ImageTk.PhotoImage(img)
+                self.iconphoto(True, self._icon_photo)
+            except Exception:
+                pass
+
+    def _on_theme_changed(self, *_args) -> None:
+        if self.theme_manager is None:
+            return
+        self.theme_manager.apply_theme_to_window(self)
+        self._apply_theme_colors()
+
+    def _apply_theme_colors(self) -> None:
+        """Recolor row tags so Completed/Cleared stays readable in both themes."""
+        if self.theme_manager is None:
+            return
+        dark = self.theme_manager.current_theme == "dark"
+        ok = "#59d499" if dark else "#1a7f37"
+        bad = "#f87171" if dark else "#b42318"
+        for tree, good_tag, bad_tag in (
+            (self.status_tree, "completed", "pending"),
+            (self.variance_tree, "cleared", "open"),
+        ):
+            try:
+                tree.tag_configure(good_tag, foreground=ok)
+                tree.tag_configure(bad_tag, foreground=bad)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ styles
     def _build_styles(self) -> None:
@@ -74,20 +158,33 @@ class GFHAuditApp(tk.Tk):
         style.configure("Treeview", rowheight=24, font=("Segoe UI", 9))
         style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
         style.configure("TButton", padding=(10, 5))
-        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), foreground="#ffffff", background="#c8102e")
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), foreground="#ffffff", background="#f0541c")
         style.configure("Stop.TButton", font=("Segoe UI", 10, "bold"), foreground="#ffffff", background="#8a1c1c")
         style.configure("Header.TLabel", font=("Segoe UI", 16, "bold"), foreground="#c8102e")
         style.configure("Sub.TLabel", foreground="#666666")
 
     def _build_header(self) -> None:
-        header = ttk.Frame(self, padding=(16, 12, 16, 4))
-        header.pack(fill="x")
-        ttk.Label(header, text="GFH Telecom LLC — Audit Automation", style="Header.TLabel").pack(side="left")
-        ttk.Label(
-            header,
-            text="WhatsApp Web • Tesseract OCR • Timesheet & BRS portals",
-            style="Sub.TLabel",
-        ).pack(side="left", padx=(14, 0), pady=(6, 0))
+        if _BRANDING_AVAILABLE and self.theme_manager is not None:
+            # Same navy GFH header as the original app: logo | red divider |
+            # centered title | theme toggle — plus the pinned copyright footer.
+            self.header = FixedHeaderManager(
+                self,
+                title="GFH Telecom LLC Inventory Audit — Timesheet Edition",
+                height=90,
+            )
+            logo = _resource_path("GFH_Telecom_Logo.png")
+            self.header.set_logo(str(logo) if logo else None, text="GFH TELECOM")
+            self.header.add_theme_toggle(self.theme_manager, callback=self._on_theme_changed)
+            self.header.add_copyright(self.theme_manager)  # pins navy footer at bottom
+        else:  # pragma: no cover — plain header fallback
+            header = ttk.Frame(self, padding=(16, 12, 16, 4))
+            header.pack(fill="x")
+            ttk.Label(header, text="GFH Telecom LLC — Audit Automation", style="Header.TLabel").pack(side="left")
+            ttk.Label(
+                header,
+                text="WhatsApp Web • Tesseract OCR • Timesheet & BRS portals",
+                style="Sub.TLabel",
+            ).pack(side="left", padx=(14, 0), pady=(6, 0))
 
         load_bar = ttk.LabelFrame(self, text="Manual workbook load (optional — portals automate this)", padding=10)
         load_bar.pack(fill="x", padx=16, pady=(8, 0))
