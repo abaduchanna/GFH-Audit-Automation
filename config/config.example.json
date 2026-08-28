@@ -1,0 +1,69 @@
+{
+  "version": 2,
+  "timesheet": {
+    "email": "timesheet-user@gfhtelecom.com",
+    "password": "T3l3com!Portal"
+  },
+  "brs": {
+    "email": "brs-user@gfhtelecom.com",
+    "password": "BRS!Portal"
+  },
+  "reminders": {
+    "reminder_interval_minutes": 5,
+    "max_reminders": 3,
+    "audit_timeout_minutes": 15,
+    "final_notice_after_last_reminder": true
+  },
+  "engine": {
+    "poll_interval_seconds": 10,
+    "group_load_wait_seconds": 25,
+    "session_wait_seconds": 180,
+    "send_retry_attempts": 3,
+    "send_retry_delay_seconds": 5,
+    "scraper_login_wait_seconds": 20,
+    "headless_scrapers": false,
+    "ocr_min_confidence": 30,
+    "ocr_language": "eng"
+  },
+  "schedule": {
+    "Houston": {
+      "district": "Houston",
+      "whatsapp_group": "GFH TELECOM HOUSTON",
+      "start_time": "09:00",
+      "enabled": true
+    },
+    "Arizona": {
+      "district": "Arizona",
+      "whatsapp_group": "GFH TELECOM ARIZONA",
+      "start_time": "09:30",
+      "enabled": true
+    },
+    "Colorado West": {
+      "district": "Colorado West",
+      "whatsapp_group": "GFH TELECOM COLORADO WEST",
+      "start_time": "10:00",
+      "enabled": true
+    },
+    "Colorado East": {
+      "district": "Colorado East",
+      "whatsapp_group": "GFH TELECOM COLORADO EAST",
+      "start_time": "10:30",
+      "enabled": true
+    },
+    "Tennessee": {
+      "district": "Tennessee",
+      "whatsapp_group": "GFH TELECOM TENNESSEE",
+      "start_time": "11:00",
+      "enabled": true
+    },
+    "Louisiana": {
+      "district": "Louisiana",
+      "whatsapp_group": "GFH TELECOM LOUISIANA",
+      "start_time": "11:30",
+      "enabled": true
+    }
+  },
+  "tesseract_path": "",
+  "ghostscript_path": "",
+  "whatsapp_browser": "chrome"
+}
