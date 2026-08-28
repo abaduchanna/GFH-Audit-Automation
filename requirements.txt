@@ -4,3 +4,6 @@ Pillow>=10.0
 pytesseract>=0.3.10
 openpyxl>=3.1
 beautifulsoup4>=4.12
+pyautogui>=0.9.54
+pyperclip>=1.8
+requests>=2.31
