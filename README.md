@@ -118,3 +118,31 @@ tests/                      # 53 unit tests
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## Build the Windows EXE (one-click)
+
+Run **`build_exe.bat`** (double-click it, or execute it from a terminal). On
+every run it:
+
+1. Verifies Git and Python 3.10+ are on `PATH` (with install links if missing)
+2. Clones this repo to `%USERPROFILE%\GFH-Audit-Automation` — or `git pull`s
+   the latest code if the folder already exists (hard-reset fallback keeps it
+   always in sync)
+3. Creates/updates a `.venv`, installs `requirements.txt` + PyInstaller
+4. Warns about optional runtime tools (Tesseract, Ghostscript, Chrome)
+5. Rebuilds `dist\GFHAuditAutomation.exe` from scratch with the committed
+   `gfh_audit.spec` (single-file, windowed)
+6. Saves a dated copy to `releases\GFHAuditAutomation_YYYYMMDD_HHMMSS.exe`
+
+Override the workspace folder or source repo before running:
+
+```bat
+set GFH_WORKDIR=D:\GFH-Audit-Automation
+set GFH_REPO_URL=https://github.com/you/your-fork.git
+build_exe.bat
+```
+
+The produced EXE is portable: its data files (SQLite DB, WhatsApp profile,
+logs, config) are created **next to the exe** on first launch. The machine
+that runs it still needs Google Chrome, and — for OCR photo matching —
+Tesseract OCR + Ghostscript (both auto-detected, links in the warnings).
