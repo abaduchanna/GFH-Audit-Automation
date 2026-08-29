@@ -50,7 +50,7 @@ REM A fresh filename per build means Windows Explorer can NEVER
 REM show a stale/blank cached icon for it.
 set "EXEVER="
 for /f "usebackq delims=" %%V in (`python -c "import gfh_audit; print(gfh_audit.__version__)" 2^>nul`) do set "EXEVER=%%V"
-if not defined EXEVER set "EXEVER=1.2.0"
+if not defined EXEVER set "EXEVER=1.2.1"
 set "BUILD_COMMIT="
 for /f "usebackq delims=" %%C in (`git rev-parse --short HEAD 2^>nul`) do set "BUILD_COMMIT=%%C"
 echo    Source commit: !BUILD_COMMIT!  (app version !EXEVER!)
@@ -108,7 +108,12 @@ if exist "dist\GFH_Inventory_Audit_Timesheet.exe" (
 if exist "dist\GFH_Audit_Automation.exe" (
     if not exist "%OUTDIR%" mkdir "%OUTDIR%"
     del /q "%OUTDIR%\GFH_Audit_Automation_v*.exe" >nul 2>&1
-    del /q "%OUTDIR%\GFH_Audit_Automation.exe" >nul 2>&1
+    copy /Y "dist\GFH_Audit_Automation.exe" "%OUTDIR%\GFH_Audit_Automation.exe" >nul
+    if errorlevel 1 (
+        echo    WARNING: could not overwrite GFH_Audit_Automation.exe - close the running exe and rebuild.
+    ) else (
+        echo    Collected: %OUTDIR%\GFH_Audit_Automation.exe
+    )
     copy /Y "dist\GFH_Audit_Automation.exe" "%OUTDIR%\GFH_Audit_Automation_v!EXEVER!.exe" >nul
     if errorlevel 1 (
         echo    WARNING: could not write GFH_Audit_Automation_v!EXEVER!.exe - close the running exe and rebuild.
@@ -118,22 +123,35 @@ if exist "dist\GFH_Audit_Automation.exe" (
 ) else (
     echo    WARNING: dist\GFH_Audit_Automation.exe not found
 )
-:: Refresh the Windows Explorer icon cache so the freshly stamped exe
-:: icons appear immediately (Windows keeps showing stale/blank icons
-:: for a rebuilt exe at the same path until the cache is refreshed).
-:: Verify the GFH icon is REALLY embedded in the built exe (reads the exe itself)
-powershell -NoProfile -Command "try { Add-Type -AssemblyName System.Drawing; $i=[System.Drawing.Icon]::ExtractAssociatedIcon('%OUTDIR%\GFH_Audit_Automation_v!EXEVER!.exe'); if ($i) { Write-Host '    Icon check: GFH icon embedded OK' } else { Write-Host '    Icon check: NO ICON EMBEDDED - report this' } } catch { Write-Host ('    Icon check: ' + $_.Exception.Message) }"
-:: Save what Windows reads out of the exe as a PNG you can open and see
-powershell -NoProfile -Command "try { Add-Type -AssemblyName System.Drawing; $i=[System.Drawing.Icon]::ExtractAssociatedIcon('%OUTDIR%\GFH_Audit_Automation_v!EXEVER!.exe'); $i.ToBitmap().Save('%OUTDIR%\GFH_icon_from_exe.png'); Write-Host '    Saved: GFH_icon_from_exe.png next to the exe (open it - it shows EXACTLY what Windows reads from the exe)' } catch { Write-Host ('    Icon PNG not saved: ' + $_.Exception.Message) }"
+:: Verify the GFH icon is REALLY embedded (Windows reads each exe itself)
+powershell -NoProfile -Command "try { Add-Type -AssemblyName System.Drawing; $i=[System.Drawing.Icon]::ExtractAssociatedIcon('%OUTDIR%\GFH_Audit_Automation.exe'); if ($i) { Write-Host '    Icon check GFH_Audit_Automation.exe: GFH icon embedded OK' } else { Write-Host '    Icon check GFH_Audit_Automation.exe: NO ICON EMBEDDED - report this' } } catch { Write-Host ('    Icon check: ' + $_.Exception.Message) }"
+powershell -NoProfile -Command "try { Add-Type -AssemblyName System.Drawing; $i=[System.Drawing.Icon]::ExtractAssociatedIcon('%OUTDIR%\GFH_Audit_Automation_v!EXEVER!.exe'); if ($i) { Write-Host '    Icon check versioned exe: GFH icon embedded OK' } else { Write-Host '    Icon check versioned exe: NO ICON EMBEDDED - report this' } } catch { Write-Host ('    Icon check: ' + $_.Exception.Message) }"
+:: Save what Windows reads out of the plain exe as a PNG you can open and see
+powershell -NoProfile -Command "try { Add-Type -AssemblyName System.Drawing; $i=[System.Drawing.Icon]::ExtractAssociatedIcon('%OUTDIR%\GFH_Audit_Automation.exe'); $i.ToBitmap().Save('%OUTDIR%\GFH_icon_from_exe.png'); Write-Host '    Saved: GFH_icon_from_exe.png - it shows EXACTLY what Windows reads from the exe' } catch { Write-Host ('    Icon PNG not saved: ' + $_.Exception.Message) }"
 :: Force the Windows shell to rebuild its icon associations (SHCNE_ASSOCCHANGED)
 powershell -NoProfile -Command "$s='[DllImport('+ [char]34 +'shell32.dll'+ [char]34 +')] public static extern void SHChangeNotify(int a,int b,IntPtr c,IntPtr d);'; $t=Add-Type -MemberDefinition $s -Name SH -Namespace W -PassThru; $t::SHChangeNotify(134217728,0,[IntPtr]::Zero,[IntPtr]::Zero)"
 ie4uinit.exe -show >nul 2>&1
+:: Ship the one-click icon cache fix next to the exes
+if exist "fix_icon_cache.bat" copy /Y "fix_icon_cache.bat" "%OUTDIR%\fix_icon_cache.bat" >nul
 
 echo.
 echo  ============================================================
-echo   Done: GFH_Inventory_Audit_Timesheet.exe (original)
-echo         + GFH_Audit_Automation_v!EXEVER!.exe   (run THIS one)
+echo   Done. Produced exes in %OUTDIR% :
+echo     GFH_Inventory_Audit_Timesheet.exe     (original app)
+echo     GFH_Audit_Automation.exe              (new app, plain name)
+echo     GFH_Audit_Automation_v!EXEVER!.exe    (new app, cache-proof name)
 echo  ============================================================
+echo.
+echo   IF EXPLORER SHOWS A BLANK ICON on GFH_Audit_Automation.exe:
+echo    - That filename was used by the first icon-less builds and
+echo      Windows still shows the cached blank icon. It is NOT a
+echo      build problem - the Icon check lines above prove the
+echo      icon IS inside the exe.
+echo    - Double-click fix_icon_cache.bat ONCE (copied next to the
+echo      exe). It restarts Explorer and wipes the icon cache; after
+echo      that the GFH icon shows on the plain exe too.
+echo    - Or run the v!EXEVER! exe: its fresh filename can never
+echo      carry a stale cached icon.
 echo.
 echo   Runtime notes:
 echo    - The bot ATTACHES to Edge on debug port 9226 (VidaPay style).
@@ -142,13 +160,8 @@ echo      the persistent profile C:\GFH_Edge_Automation_Profile.
 echo    - Scan the WhatsApp Web QR once in that Edge window; it stays
 echo      logged in across runs.
 echo    - Tesseract OCR + Ghostscript enable the OCR photo matching.
-echo    - Run GFH_Audit_Automation_v!EXEVER!.exe - the versioned
-echo      filename guarantees Windows always renders a fresh GFH
-echo      icon (no stale icon cache possible). If you had a desktop
-echo      shortcut to the old name, delete and recreate it - the
-echo      shortcut itself caches icons.
-echo    - "Icon check: GFH icon embedded OK" above means the icon
-echo      is inside the exe; anything else, report the message.
+echo    - Always build with THIS bat from the repo. Old copies of
+echo      earlier bats on your PC ship old logic - delete them.
 echo.
 pause
 endlocal
