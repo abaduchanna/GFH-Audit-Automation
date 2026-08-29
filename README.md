@@ -1,22 +1,35 @@
 # GFH Audit Automation
 
-## v1.1.0 — full GFH branding now built into the modular app
+## v1.2.1 — build info, icon proof and the icon-cache fix
 
-`GFH_Audit_Automation.exe` (the refactored app below) now ships with the
-**same GFH branding as the original**: navy fixed header with the GFH Telecom
-logo and red divider, dark/light theme with the header toggle button, pinned
-copyright footer, and the `gfh_icon.ico` window + taskbar icon (the exe file
-icon is branded too). The title bar shows
-`GFH Telecom LLC Inventory Audit - Timesheet Edition v1.1.0` so you can
-confirm you are running the new build.
+The modular app ships with the **same GFH branding as the original**: navy
+fixed header with the GFH Telecom logo and red divider, dark/light theme with
+the header toggle button, pinned copyright footer, and the `gfh_icon.ico`
+window + taskbar icon (the exe file icon is branded too). On every launch the
+app writes **`GFH_Build_Info.txt`** next to the exe (version, exe path, ico/logo
+found, window icon applied) so you can always prove exactly what is running.
 
-**Run `GFH_Audit_Automation_v1.1.0.exe`** — it is the one with the branding *and*
-the VidaPay-style runtime: START button → WhatsApp unread-badge notification
-polling → BeautifulSoup conversation parsing → OCR images for IMEIs with
-duplicate-scan elimination, over Edge debug port 9226. The build bat names
-the exe with the app version (`GFH_Audit_Automation_v<version>.exe`) and
-deletes older copies, so every build is a fresh file — Windows can never
-show you a stale icon for it.
+The build produces **both** automation exe names in the output folder:
+
+- `GFH_Audit_Automation.exe` — the plain name (same as always)
+- `GFH_Audit_Automation_v<version>.exe` — fresh filename per version, immune
+  to stale Explorer icon caches
+
+Both are icon-verified by the build (`Icon check ... GFH icon embedded OK`),
+and `GFH_icon_from_exe.png` is saved next to them — a picture of exactly what
+Windows reads out of the exe.
+
+**If File Explorer still shows a blank icon on the plain-named exe**, the icon
+is *inside* the file (the Icon check + PNG prove it) — it is the Windows icon
+cache, poisoned by the very first icon-less builds of that filename. Run
+**`fix_icon_cache.bat`** (copied next to the exe by the build) **once**. It
+restarts Explorer and wipes the icon cache databases; after that the GFH icon
+shows on the plain exe too. Or simply run the `v<version>` exe, which can
+never carry a stale cached icon.
+
+> Always build with `build_GFH_Audit_Automation.bat` **from this repo**. Old
+> copies of earlier bats still ship old logic (plain-name-only output, no icon
+> verification) — delete them.
 
 `GFH_Inventory_Audit_Timesheet.exe` remains the untouched original
 (byte-for-byte) with its classic behaviour.
@@ -208,7 +221,10 @@ a terminal). On every run it:
    workpath to `%TEMP%\pyi_build\GFH_Audit_Automation`
 4. Installs `requirements.txt`
 5. Builds with the committed `GFH_Audit_Automation.spec` (single-file, windowed)
-6. Copies the result to `C:\Users\AbadUmairChanna\Downloads\GitHub\GFH_Audit_Automation.exe`
+6. Copies the result to
+   `C:\Users\AbadUmairChanna\Downloads\GitHub\GFH_Audit_Automation.exe`
+   **and** `GFH_Audit_Automation_v<version>.exe`, icon-verifies both,
+   saves `GFH_icon_from_exe.png`, and copies `fix_icon_cache.bat` next to them
 
 The produced EXE is portable: its data files (SQLite DB, logs, config,
 `portal_downloads/`) are created **next to the exe** on first launch. The
@@ -223,22 +239,23 @@ The GFH icon **is embedded** in both exes (`gfh_icon.ico`, 16–256 px frames;
 `GFH_Audit_Automation.spec` sets `icon=` and the app also sets the
 window/taskbar icon at runtime). If File Explorer still shows a blank or old
 icon after a rebuild, that is the **Windows shell icon cache**, not a missing
-icon. Any one of these fixes it:
+icon.
 
-```bat
-ie4uinit.exe -show
-```
-or rename the exe once (a new path gets a fresh icon), or restart Explorer
-(Task Manager → Windows Explorer → Restart). To verify the real icon,
-right-click the exe → **Properties** — the dialog shows the embedded GFH icon.
+`build_GFH_Audit_Automation.bat` already runs `ie4uinit.exe -show`, forces a
+shell icon rebuild (`SHChangeNotify(SHCNE_ASSOCCHANGED)`) and **verifies the
+icon is really embedded** by extracting it from both built exes (`Icon check
+... GFH icon embedded OK` in the build output) — so on this machine those
+gentle refreshes were not enough.
 
-`build_GFH_Audit_Automation.bat` now runs `ie4uinit.exe -show` automatically
-after copying the exes, forces a shell icon rebuild
-(`SHChangeNotify(SHCNE_ASSOCCHANGED)`), and **verifies the icon is really
-embedded** by extracting it from the built exe (`Icon check: GFH icon
-embedded OK` in the build output).
+**Definitive fix — `fix_icon_cache.bat`** (in the repo root and copied next to
+the exe by every build): double-click it once, press `Y`. It closes Explorer,
+deletes the icon cache databases (`%LocalAppData%\IconCache.db` and
+`%LocalAppData%\Microsoft\Windows\Explorer\iconcache_*.db`) and restarts
+Explorer. This wipes the per-path cache that `ie4uinit` cannot reach; the GFH
+icon then appears on `GFH_Audit_Automation.exe` itself. The taskbar blinks for
+1–2 seconds and nothing else is touched. If a desktop shortcut still shows a
+blank icon afterwards, delete and recreate the shortcut (shortcuts cache icons
+independently).
 
-**Guaranteed fix:** the bat ships the exe as
-`GFH_Audit_Automation_v<version>.exe` — a fresh filename on every build, so
-Explorer has no cached icon to fall back on. If you keep a desktop shortcut,
-recreate it after a version bump (shortcuts cache icons independently).
+**Cache-proof alternative:** run `GFH_Audit_Automation_v<version>.exe` — a
+fresh filename per version, so Explorer has no cached icon to fall back on.
