@@ -1,6 +1,12 @@
 # GFH Audit Automation
 
-## v1.2.1 — build info, icon proof and the icon-cache fix
+## v1.2.2 — automation-only build + icon cache fix
+
+**The build bat now builds ONLY `GFH_Audit_Automation`** — the original
+timesheet exe is no longer produced. Its source stays archived in the repo
+(`GFH_Inventory_Audit_Timesheet.py` + its `.spec`); if you ever want it back,
+build it manually with
+`python -m PyInstaller GFH_Inventory_Audit_Timesheet.spec --noconfirm --clean`.
 
 The modular app ships with the **same GFH branding as the original**: navy
 fixed header with the GFH Telecom logo and red divider, dark/light theme with
@@ -51,8 +57,9 @@ Run it exactly as before:
 python GFH_Inventory_Audit_Timesheet.py
 ```
 
-`build_GFH_Audit_Automation.bat` builds **both** executables: the original
-branded app first, then the refactored modular app below.
+`build_GFH_Audit_Automation.bat` builds **only the refactored modular app**
+below (as of v1.2.2). The original app's files stay archived in the repo but
+are not built by the bat anymore.
 
 ---
 

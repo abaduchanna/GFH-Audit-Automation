@@ -1,6 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
-title Build GFH Audit Timesheet (original) + GFH_Audit_Automation
+title Build GFH Audit Automation
 
 set "SRCDIR=C:\Users\AbadUmairChanna\Downloads\GitHub\GFH-Audit-Automation"
 set "OUTDIR=C:\Users\AbadUmairChanna\Downloads\GitHub"
@@ -8,7 +8,7 @@ set "WORKBASE=%TEMP%\pyi_build\GFH_Audit_Automation"
 
 echo.
 echo  ============================================================
-echo   Building: GFH_Inventory_Audit_Timesheet.exe + GFH_Audit_Automation.exe
+echo   Building: GFH_Audit_Automation.exe (automation app only)
 echo  ============================================================
 echo.
 
@@ -50,7 +50,7 @@ REM A fresh filename per build means Windows Explorer can NEVER
 REM show a stale/blank cached icon for it.
 set "EXEVER="
 for /f "usebackq delims=" %%V in (`python -c "import gfh_audit; print(gfh_audit.__version__)" 2^>nul`) do set "EXEVER=%%V"
-if not defined EXEVER set "EXEVER=1.2.1"
+if not defined EXEVER set "EXEVER=1.2.2"
 set "BUILD_COMMIT="
 for /f "usebackq delims=" %%C in (`git rev-parse --short HEAD 2^>nul`) do set "BUILD_COMMIT=%%C"
 echo    Source commit: !BUILD_COMMIT!  (app version !EXEVER!)
@@ -73,19 +73,7 @@ if exist "requirements.txt" (
     python -m pip install -r requirements.txt --quiet 2>nul
 )
 
-REM Build 1: the ORIGINAL GFH Audit Timesheet app (exact copy, full branding)
-echo    Building GFH_Inventory_Audit_Timesheet.spec (original app with logos/icons)...
-python -m PyInstaller "GFH_Inventory_Audit_Timesheet.spec" --noconfirm --clean --workpath "%WORKBASE%" 2>&1
-
-if errorlevel 1 (
-    echo    FAILED: GFH_Inventory_Audit_Timesheet
-    pause
-    exit /b 1
-)
-
-echo    SUCCESS: GFH_Inventory_Audit_Timesheet
-
-REM Build 2: the refactored modular app
+REM Build the refactored modular app
 echo    Building GFH_Audit_Automation.spec...
 python -m PyInstaller "GFH_Audit_Automation.spec" --noconfirm --clean --workpath "%WORKBASE%" 2>&1
 
@@ -98,13 +86,6 @@ if errorlevel 1 (
 echo    SUCCESS: GFH_Audit_Automation
 
 REM Copy .exe files to output
-if exist "dist\GFH_Inventory_Audit_Timesheet.exe" (
-    if not exist "%OUTDIR%" mkdir "%OUTDIR%"
-    copy /Y "dist\GFH_Inventory_Audit_Timesheet.exe" "%OUTDIR%\GFH_Inventory_Audit_Timesheet.exe" >nul
-    echo    Collected: %OUTDIR%\GFH_Inventory_Audit_Timesheet.exe
-) else (
-    echo    WARNING: dist\GFH_Inventory_Audit_Timesheet.exe not found
-)
 if exist "dist\GFH_Audit_Automation.exe" (
     if not exist "%OUTDIR%" mkdir "%OUTDIR%"
     del /q "%OUTDIR%\GFH_Audit_Automation_v*.exe" >nul 2>&1
@@ -137,7 +118,6 @@ if exist "fix_icon_cache.bat" copy /Y "fix_icon_cache.bat" "%OUTDIR%\fix_icon_ca
 echo.
 echo  ============================================================
 echo   Done. Produced exes in %OUTDIR% :
-echo     GFH_Inventory_Audit_Timesheet.exe     (original app)
 echo     GFH_Audit_Automation.exe              (new app, plain name)
 echo     GFH_Audit_Automation_v!EXEVER!.exe    (new app, cache-proof name)
 echo  ============================================================
