@@ -18,3 +18,5 @@ dist/
 *.spec.bak
 .venv/
 releases/
+GFH_Build_Info.txt
+GFH_icon_from_exe.png

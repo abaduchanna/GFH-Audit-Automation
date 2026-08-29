@@ -50,7 +50,11 @@ REM A fresh filename per build means Windows Explorer can NEVER
 REM show a stale/blank cached icon for it.
 set "EXEVER="
 for /f "usebackq delims=" %%V in (`python -c "import gfh_audit; print(gfh_audit.__version__)" 2^>nul`) do set "EXEVER=%%V"
-if not defined EXEVER set "EXEVER=1.1.0"
+if not defined EXEVER set "EXEVER=1.2.0"
+set "BUILD_COMMIT="
+for /f "usebackq delims=" %%C in (`git rev-parse --short HEAD 2^>nul`) do set "BUILD_COMMIT=%%C"
+echo    Source commit: !BUILD_COMMIT!  (app version !EXEVER!)
+
 
 REM Clean previous build
 echo    Cleaning previous build...
@@ -119,6 +123,8 @@ if exist "dist\GFH_Audit_Automation.exe" (
 :: for a rebuilt exe at the same path until the cache is refreshed).
 :: Verify the GFH icon is REALLY embedded in the built exe (reads the exe itself)
 powershell -NoProfile -Command "try { Add-Type -AssemblyName System.Drawing; $i=[System.Drawing.Icon]::ExtractAssociatedIcon('%OUTDIR%\GFH_Audit_Automation_v!EXEVER!.exe'); if ($i) { Write-Host '    Icon check: GFH icon embedded OK' } else { Write-Host '    Icon check: NO ICON EMBEDDED - report this' } } catch { Write-Host ('    Icon check: ' + $_.Exception.Message) }"
+:: Save what Windows reads out of the exe as a PNG you can open and see
+powershell -NoProfile -Command "try { Add-Type -AssemblyName System.Drawing; $i=[System.Drawing.Icon]::ExtractAssociatedIcon('%OUTDIR%\GFH_Audit_Automation_v!EXEVER!.exe'); $i.ToBitmap().Save('%OUTDIR%\GFH_icon_from_exe.png'); Write-Host '    Saved: GFH_icon_from_exe.png next to the exe (open it - it shows EXACTLY what Windows reads from the exe)' } catch { Write-Host ('    Icon PNG not saved: ' + $_.Exception.Message) }"
 :: Force the Windows shell to rebuild its icon associations (SHCNE_ASSOCCHANGED)
 powershell -NoProfile -Command "$s='[DllImport('+ [char]34 +'shell32.dll'+ [char]34 +')] public static extern void SHChangeNotify(int a,int b,IntPtr c,IntPtr d);'; $t=Add-Type -MemberDefinition $s -Name SH -Namespace W -PassThru; $t::SHChangeNotify(134217728,0,[IntPtr]::Zero,[IntPtr]::Zero)"
 ie4uinit.exe -show >nul 2>&1
