@@ -74,6 +74,7 @@ class GFHAuditApp(tk.Tk):
         else:  # pragma: no cover
             self.theme_manager = None
         self._set_window_icon()
+        self._write_build_info()
 
         ensure_runtime_dirs()
         self.config_store = ConfigStore()
@@ -104,12 +105,14 @@ class GFHAuditApp(tk.Tk):
     # ------------------------------------------------------------------ branding
     def _set_window_icon(self) -> None:
         """Window + taskbar icon (gfh_icon.ico), PNG logo fallback."""
+        self._icon_applied = False
         ico = _resource_path("gfh_icon.ico")
         if ico is not None:
             try:
                 # default=... applies to BOTH title bar and taskbar button
                 self.iconbitmap(default=str(ico))
                 self.after(150, lambda: self.iconbitmap(default=str(ico)))
+                self._icon_applied = True
                 return
             except Exception:
                 pass
@@ -122,8 +125,34 @@ class GFHAuditApp(tk.Tk):
                 img.thumbnail((64, 64))
                 self._icon_photo = ImageTk.PhotoImage(img)
                 self.iconphoto(True, self._icon_photo)
+                self._icon_applied = True
             except Exception:
                 pass
+
+    def _write_build_info(self) -> None:
+        """Write a small diagnostic file next to the exe (repo root in dev).
+
+        Makes it instantly visible WHICH build is running, from WHERE, and
+        whether the branding assets were found - no guesswork needed.
+        """
+        try:
+            frozen = bool(getattr(sys, "frozen", False))
+            base = Path(sys.executable).resolve().parent if frozen else Path.cwd()
+            ico = _resource_path("gfh_icon.ico")
+            logo = _resource_path("GFH_Telecom_Logo.png")
+            info = (
+                "GFH Audit Automation - build info\n"
+                f"generated:       {now_text()}\n"
+                f"version:         {__version__}\n"
+                f"frozen exe:      {frozen}\n"
+                f"running from:    {Path(sys.executable).resolve() if frozen else 'python main.py (source)'}\n"
+                f"gfh_icon.ico:    {ico if ico else 'NOT FOUND'}\n"
+                f"logo png:        {logo if logo else 'NOT FOUND'}\n"
+                f"window icon set: {bool(getattr(self, '_icon_applied', False))}\n"
+            )
+            (base / "GFH_Build_Info.txt").write_text(info, encoding="utf-8")
+        except Exception:
+            logger.debug("build info write failed", exc_info=True)
 
     def _on_theme_changed(self, *_args) -> None:
         if self.theme_manager is None:
