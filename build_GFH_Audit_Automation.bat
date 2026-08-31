@@ -37,6 +37,8 @@ REM Clone or pull
 if exist "%SRCDIR%" (
     echo    Pulling latest...
     cd "%SRCDIR%"
+    REM Self-heal: old clones carry a dead embedded token in origin - reset to the clean public URL.
+    git remote set-url origin "https://github.com/abaduchanna/GFH-Audit-Automation.git" >nul 2>&1
     git pull 2>&1
 ) else (
     echo    Cloning GFH-Audit-Automation...
