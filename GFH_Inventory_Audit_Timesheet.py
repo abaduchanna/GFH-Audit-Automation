@@ -854,8 +854,8 @@ def build_store_maps(
             if not emp_raw or "TOTAL" in emp_raw.upper() or "\u2014 " in emp_raw or "-- " in emp_raw:
                 continue
             # Don't skip rows with no Clock In — the employee may still be
-            # at the store (count pending). Previously we skipped these which
-            # caused "Employee at store: (no timesheet entry)" for pending stores.
+            # at the store with the count pending, and the pending-store
+            # reminder is built from these rows.
             store_raw = rec.get(ts_store_col, "") if ts_store_col else ""
             norm = normalize_store(store_raw)
             if not norm:
@@ -5095,27 +5095,19 @@ class GFHApp(tk.Tk):
         return " ".join(phones) + " please share the images of the variances."
 
     def pending_inventory_count_message(self, rows: List[InventoryStatusRow]) -> str:
-        """Build the per-store "count not completed" message sent after the
-        Inventory Audit Status image.
+        """Build the per-store reminder sent after the Inventory Audit Status
+        image.
 
-        Format per task spec:
-            ⚠️ {Store Name} — Count not completed
-            Employee at store: {Employee Name}
+        Format per task spec — one plain line per pending store, blocks
+        separated by a blank line:
 
-        Each pending store gets its own block (separated by a blank line).
-        The employee name comes from ``InventoryStatusRow.rep_name``, which
-        is populated by ``build_store_maps`` from the Timesheet Employee
-        column (matched by Store).
+            {Store Name}, please complete the inventory count ASAP.
 
-        If we can resolve a phone for the employee (via the timesheet-aware
-        ``resolve_phone_for_rep`` resolver), we also drop a WhatsApp
-        ``@phone`` mention on its own line so the rep actually gets pinged.
-        Each distinct phone is mentioned only once even if the same rep is
-        at multiple pending stores.
+        No "⚠️ … — Count not completed" header, no "Employee at store:"
+        line, and no WhatsApp @mention — just the store name and the ask.
         """
         messages: List[str] = []
         seen_stores: set[str] = set()
-        mentioned_phones: set[str] = set()
 
         for row in rows:
             if safe_text(row.status).lower() == "completed":
@@ -5126,34 +5118,7 @@ class GFHApp(tk.Tk):
                 continue
             seen_stores.add(store_name)
 
-            rep_name = safe_text(row.rep_name)
-            # InventoryStatusRow doesn't carry created_by, but rep_name here
-            # comes from build_store_maps → timesheet Employee column, so
-            # resolve_phone_for_rep will match it against both tables.
-            phone = normalize_phone(self.db.resolve_phone_for_rep(rep_name))
-
-            # Header line — always present for a pending store.
-            block_lines = [f"⚠️ {store_name} — Count not completed"]
-
-            # Employee line — show the timesheet employee at the store.
-            # If the timesheet didn't resolve a rep for this store, say so
-            # explicitly so the district manager knows the lookup failed
-            # (rather than silently omitting the line).
-            if rep_name:
-                block_lines.append(f"Employee at store: {rep_name}")
-            else:
-                block_lines.append("Employee at store: (no timesheet entry for this store)")
-
-            # WhatsApp @mention — only if we resolved a phone and we haven't
-            # already mentioned this rep in a previous block (avoids spamming
-            # the same rep once per store they're at).
-            if phone and phone not in mentioned_phones:
-                mentioned_phones.add(phone)
-                block_lines.append(
-                    f"{whatsapp_mention(phone)} please complete an inventory count ASAP."
-                )
-
-            messages.append("\n".join(block_lines))
+            messages.append(f"{store_name}, please complete the inventory count ASAP.")
 
         return "\n\n".join(messages)
 
