@@ -109,6 +109,7 @@ def normalize_district(text: str) -> str:
     if lower.startswith("arizona"):
         return "Arizona"
     aliases = {
+        "atlanta": "Atlanta",
         "colorado west": "Colorado West",
         "houston": "Houston",
         "colorado east": "Colorado East",
