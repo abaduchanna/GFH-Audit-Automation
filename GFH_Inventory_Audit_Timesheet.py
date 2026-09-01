@@ -823,6 +823,88 @@ def read_xlsx_records(path: str | Path) -> List[Dict[str, str]]:
     return reader.read_sheet()
 
 
+def build_ts_store_to_employee(time_sheet_records: List[Dict[str, str]]) -> Dict[str, str]:
+    """Map normalized store → employee name from Timesheet rows.
+
+    Keeps rows without a Clock In too — the employee may still be at the
+    store with the count pending, and the pending-store rep lookup is
+    built from these rows. When a store has several rows, the latest
+    Clock In wins (falling back to row order when Clock In is missing).
+    """
+    ts_store_to_employee: Dict[str, str] = {}
+    if not time_sheet_records:
+        return ts_store_to_employee
+    sample_ts    = time_sheet_records[0]
+    ts_store_col = find_column(sample_ts, ["Store"])
+    ts_emp_col   = find_column(sample_ts, ["Employee", "Employee Name",
+                                           "Salesperson", "Sales Person", "Rep Name"])
+    ts_clock_col = find_column(sample_ts, ["Clock In", "Clock-In", "Clock In "])
+    latest_ts: Dict[str, float] = {}
+    for idx, rec in enumerate(time_sheet_records):
+        emp_raw = safe_text(rec.get(ts_emp_col, "")) if ts_emp_col else ""
+        # Skip TOTAL/subtotal rows
+        if not emp_raw or "TOTAL" in emp_raw.upper() or "\u2014 " in emp_raw or "-- " in emp_raw:
+            continue
+        store_raw = rec.get(ts_store_col, "") if ts_store_col else ""
+        norm = normalize_store(store_raw)
+        if not norm:
+            continue
+        clock_in_val = safe_text(rec.get(ts_clock_col, "")) if ts_clock_col else ""
+        score = numeric_excel_date(clock_in_val) if clock_in_val.strip() else float(idx)
+        if score >= latest_ts.get(norm, -1.0):
+            ts_store_to_employee[norm] = emp_raw.strip()
+            latest_ts[norm] = score
+    return ts_store_to_employee
+
+
+def store_name_tokens(norm_store: str) -> Tuple[str, ...]:
+    """Alphanumeric tokens of an already-normalized store name, deduped."""
+    return tuple(dict.fromkeys(t for t in re.findall(r"[a-z0-9]+", norm_store or "") if t))
+
+
+def match_store_employee(norm_store: str, ts_store_to_employee: Dict[str, str]) -> str:
+    """Resolve the timesheet employee for a store.
+
+    Exact normalized-store lookup first, then a tolerant token-overlap
+    match. The timesheet export and the count file often spell the same
+    store slightly differently ("Kings Highway #1204" vs "Kings Highway
+    Store 1204"), which left pending stores without an employee name even
+    when the timesheet had a clock-in for them. A token match is accepted
+    when one name's tokens are a subset of the other's — but never when a
+    distinguishing store number conflicts ("Store 1204" vs "Store 1205"
+    do not match). Ties go to the candidate with the most token overlap,
+    then the shortest name.
+    """
+    if not norm_store or not ts_store_to_employee:
+        return ""
+    exact = ts_store_to_employee.get(norm_store)
+    if exact:
+        return exact
+    target_tokens = set(store_name_tokens(norm_store))
+    if not target_tokens:
+        return ""
+    best_name = ""
+    best_overlap = 0
+    best_len = -1
+    for ts_norm, employee in ts_store_to_employee.items():
+        if not ts_norm or not employee:
+            continue
+        ts_tokens = set(store_name_tokens(ts_norm))
+        if not ts_tokens:
+            continue
+        if target_tokens <= ts_tokens or ts_tokens <= target_tokens:
+            overlap = len(target_tokens & ts_tokens)
+            if overlap > best_overlap or (overlap == best_overlap and best_len != -1 and len(ts_norm) < best_len):
+                best_name = employee
+                best_overlap = overlap
+                best_len = len(ts_norm)
+            elif best_len == -1:
+                best_name = employee
+                best_overlap = overlap
+                best_len = len(ts_norm)
+    return best_name
+
+
 def build_store_maps(
     inventory_records: List[Dict[str, str]],
     time_sheet_records: List[Dict[str, str]],
@@ -830,7 +912,8 @@ def build_store_maps(
     """Build store lookups using Count Details as the source of truth.
 
     - Store names and Districts come from Inventory_Count_Result_Details.
-    - Employee (rep) names come from the Timesheet by matching on Store.
+    - Employee (rep) names come from the Timesheet by matching on Store,
+      tolerating slight store-name differences between the two exports.
     - Timesheet is ONLY used to resolve who worked at each store.
     """
     district_by_store: Dict[str, str] = {}
@@ -838,33 +921,7 @@ def build_store_maps(
     rep_by_store:      Dict[str, str] = {}   # norm_store → full Employee name
 
     # ── Step 1: Build store → employee map from Timesheet ─────────────────
-    # Only use rows where Clock In is present — a row without a clock-in
-    # means the employee was scheduled but didn't actually work that day.
-    ts_store_to_employee: Dict[str, str] = {}
-    if time_sheet_records:
-        sample_ts    = time_sheet_records[0]
-        ts_store_col = find_column(sample_ts, ["Store"])
-        ts_emp_col   = find_column(sample_ts, ["Employee", "Employee Name",
-                                               "Salesperson", "Sales Person", "Rep Name"])
-        ts_clock_col = find_column(sample_ts, ["Clock In", "Clock-In", "Clock In "])
-        latest_ts: Dict[str, float] = {}
-        for idx, rec in enumerate(time_sheet_records):
-            emp_raw = safe_text(rec.get(ts_emp_col, "")) if ts_emp_col else ""
-            # Skip TOTAL/subtotal rows
-            if not emp_raw or "TOTAL" in emp_raw.upper() or "\u2014 " in emp_raw or "-- " in emp_raw:
-                continue
-            # Don't skip rows with no Clock In — the employee may still be
-            # at the store with the count pending, and the pending-store
-            # reminder is built from these rows.
-            store_raw = rec.get(ts_store_col, "") if ts_store_col else ""
-            norm = normalize_store(store_raw)
-            if not norm:
-                continue
-            clock_in_val = safe_text(rec.get(ts_clock_col, "")) if ts_clock_col else ""
-            score = numeric_excel_date(clock_in_val) if clock_in_val.strip() else float(idx)
-            if score >= latest_ts.get(norm, -1.0):
-                ts_store_to_employee[norm] = emp_raw.strip()
-                latest_ts[norm] = score
+    ts_store_to_employee = build_ts_store_to_employee(time_sheet_records)
 
     # ── Step 2: Build district/display maps from Count Details ────────────
     if not inventory_records:
@@ -892,9 +949,12 @@ def build_store_maps(
             if district and district != "Unknown":
                 district_by_store[norm] = district
 
-        # Employee name from timesheet (matched by store)
-        if norm in ts_store_to_employee and norm not in rep_by_store:
-            rep_by_store[norm] = ts_store_to_employee[norm]
+        # Employee name from timesheet (matched by store, tolerant of
+        # slight name differences between the two exports)
+        if norm not in rep_by_store:
+            employee = ts_store_to_employee.get(norm) or match_store_employee(norm, ts_store_to_employee)
+            if employee:
+                rep_by_store[norm] = employee
 
     return district_by_store, display_by_store, rep_by_store
 
@@ -1142,6 +1202,12 @@ def build_inventory_status_rows(
     # build_store_maps gives us employee (rep) names matched by store.
     # It does NOT drive which stores appear — count details is the source of truth.
     _, _, rep_by_store = build_store_maps(inventory_records, time_sheet_records)
+    # Timesheet store → employee map used as a fallback for pending stores
+    # that never appear in the count file (master-list-only stores): those
+    # stores are missing from rep_by_store because build_store_maps only
+    # transfers employees for count-file stores, yet the timesheet clearly
+    # shows who clocked in there.
+    ts_store_to_employee = build_ts_store_to_employee(time_sheet_records)
 
     # Build store display names AND districts directly from count details so
     # every store in the count file appears regardless of timesheet coverage.
@@ -1216,6 +1282,11 @@ def build_inventory_status_rows(
             or "Unknown"
         )
         rep_name = safe_text(rep_by_store.get(norm, ""))
+        if not rep_name:
+            # Pending stores that never appear in the count file still get
+            # their timesheet employee here (exact match, then tolerant
+            # token-overlap match on the store name).
+            rep_name = safe_text(match_store_employee(norm, ts_store_to_employee))
         status = "Completed" if norm in completed_store_norms else "Pending"
         key_raw = f"{norm}|{district}|{status}|status"
         key = hashlib.sha1(key_raw.encode("utf-8", errors="ignore")).hexdigest()
