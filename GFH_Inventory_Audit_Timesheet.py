@@ -456,6 +456,7 @@ def normalize_district(text: str) -> str:
     if lower.startswith("arizona"):
         return "Arizona"
     aliases = {
+        "atlanta": "Atlanta",
         "colorado west": "Colorado West",
         "houston": "Houston",
         "colorado east": "Colorado East",
@@ -5309,6 +5310,7 @@ class GFHApp(tk.Tk):
         white = (255, 255, 255)
         district_colors = {
             "Arizona": (196, 138, 230),
+            "Atlanta": (189, 49, 120),
             "Colorado East": (96, 194, 236),
             "Colorado West": (78, 186, 228),
             "Houston": (244, 128, 128),
