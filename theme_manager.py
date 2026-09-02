@@ -55,7 +55,7 @@ class ThemeManager:
 
     def __init__(self, default="dark", app_name="GFH"):
         self.app_name = app_name
-        self.CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "gfh-telecom", app_name)
+        self.CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "GFH-Telecom", app_name)
         self.CONFIG_FILE = os.path.join(self.CONFIG_DIR, "theme.json")
         self.current_theme = self._load_theme() or default
         os.makedirs(self.CONFIG_DIR, exist_ok=True)
@@ -238,3 +238,56 @@ def apply_theme_to_window(window, theme_manager=None):
 
 def get_copyright_year():
     return ThemeManager.get_copyright_year()
+
+
+# ── Verge-style abstract band texture (brand-fixed, theme-independent) ──
+# Mirrors the VergeDesk reference: near-black brand band with huge, subtle
+# abstract circles - blue tints hugging the TOP-RIGHT of the header band,
+# a green arc peeking from the BOTTOM-LEFT of the footer band.
+
+BAND_BG = "#090d26"
+
+_HEADER_CIRCLES = (
+    # (fill, center_x_rel, center_y_rel, radius_rel_to_height)
+    ("#0e1634", 0.94, 0.10, 1.55),   # large circle hugging the top-right corner
+    ("#111c46", 0.74, 1.10, 1.05),   # softer companion circle below-left of it
+)
+
+_FOOTER_CIRCLES = (
+    ("#0a1f16", 0.05, 1.75, 1.90),   # green tint peeking from the bottom-left
+    ("#0e1634", 0.35, 2.30, 1.60),   # faint blue companion arc
+)
+
+
+def draw_band_texture(canvas, zone="header"):
+    """Paint the Verge-style abstract circles onto a brand band canvas.
+
+    zone="header": big blue-tinted circles anchored to the top-right.
+    zone="footer": green-tinted arc peeking from the bottom-left.
+
+    Geometry is computed from the canvas's CURRENT size, so this is safe to
+    call again on every <Configure> (resize) event. Items are tagged
+    "band_texture" and stacked below everything else on the canvas, so text
+    and widgets drawn after this stay visible on top.
+    """
+    try:
+        width = int(canvas.winfo_width())
+        height = int(canvas.winfo_height())
+    except Exception:
+        return
+    if width <= 2 or height <= 2:
+        return
+    canvas.delete("band_texture")
+    circles = _HEADER_CIRCLES if zone == "header" else _FOOTER_CIRCLES
+    for color, cx_rel, cy_rel, r_rel in circles:
+        radius = height * r_rel
+        cx = width * cx_rel
+        cy = height * cy_rel
+        canvas.create_oval(
+            cx - radius, cy - radius, cx + radius, cy + radius,
+            fill=color, outline="", width=0, tags=("band_texture",),
+        )
+    try:
+        canvas.tag_lower("band_texture")
+    except Exception:
+        pass

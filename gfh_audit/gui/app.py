@@ -69,7 +69,7 @@ class GFHAuditApp(tk.Tk):
 
         # GFH branding: navy header + logo + dark/light theme + footer copyright
         if _BRANDING_AVAILABLE:
-            self.theme_manager = ThemeManager("GFH Inventory Audit", app_name="vidapay-gfh")
+            self.theme_manager = ThemeManager("GFH Inventory Audit", app_name="VidaPay-GFH")
             self.theme_manager.current_theme = "dark"  # original app always starts dark
         else:  # pragma: no cover
             self.theme_manager = None
