@@ -2751,7 +2751,7 @@ class GFHApp(tk.Tk):
         self.status_checked_keys: set[str] = set()
         self.audit_checked_keys: set[str] = set()
 
-        self.theme_manager = ThemeManager("GFH Inventory Audit", app_name="vidapay-gfh")
+        self.theme_manager = ThemeManager("GFH Inventory Audit", app_name="VidaPay-GFH")
         # Always start dark — override any saved light preference
         self.theme_manager.current_theme = "dark"
         self._build_ui()
