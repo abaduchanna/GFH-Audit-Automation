@@ -97,47 +97,6 @@ class FixedHeaderManager:
         self.right_frame._tag  = "header"
         self.logo_label._tag   = "header"
         self.title_label._tag  = "header"
-
-        # ── Verge-style abstract texture ──
-        # A canvas sits directly ABOVE the (full-area, flat navy) title label
-        # and BELOW the packed edge widgets (logo, divider, theme toggle).
-        # The canvas paints the abstract circles AND re-draws the centered
-        # title, because its own surface covers the plain label below it.
-        try:
-            import tkinter as tk  # lazy import
-            from theme_manager import draw_band_texture  # module-level painter
-            self._draw_band_texture = draw_band_texture
-            self.texture_canvas = tk.Canvas(
-                self.header_frame, bg=self.BRAND_NAVY,
-                highlightthickness=0, borderwidth=0, bd=0,
-            )
-            self.texture_canvas.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
-            # Stack: title label (bottom) < texture canvas < packed widgets.
-            self.texture_canvas.lift(self.title_label)
-            self.header_frame.bind("<Configure>", self._repaint_band)
-            self.header_frame.after_idle(self._repaint_band)
-        except Exception:
-            self.texture_canvas = None
-
-    def _repaint_band(self, event=None):
-        """Repaint Verge texture + centered title on the header band canvas."""
-        canvas = getattr(self, "texture_canvas", None)
-        painter = getattr(self, "_draw_band_texture", None)
-        if canvas is None or painter is None:
-            return
-        try:
-            canvas.delete("band_title")
-            painter(canvas, "header")
-            width = int(canvas.winfo_width())
-            height = int(canvas.winfo_height())
-            if width > 2 and height > 2 and self.title:
-                canvas.create_text(
-                    width / 2, height / 2, text=self.title,
-                    font=("Segoe UI", 16, "bold"), fill="#ffffff",
-                    tags=("band_title",),
-                )
-        except Exception:
-            pass
     
     def set_logo(self, logo_path=None, text="Logo"):
         """Set the logo in the header."""
@@ -194,8 +153,8 @@ class FixedHeaderManager:
     def add_copyright(self, theme_manager):
         """Build a pinned footer bar (dark navy, never theme-changes) with centered copyright text."""
         import tkinter as tk  # lazy import — was missing and crashed the frozen exe (NameError: tk)
+
         copyright_text = theme_manager.get_copyright_text()
-        self._footer_text = copyright_text
 
         # Footer bar pinned to bottom of the PARENT window — not inside the header frame
         self.footer_frame = tk.Frame(
@@ -218,45 +177,6 @@ class FixedHeaderManager:
         )
         self.copyright_label.pack(expand=True, fill="both")
         self.copyright_label._tag = "footer"
-
-        # ── Verge-style texture on the footer: green arc from bottom-left.
-        # The canvas covers the plain label, so the copyright text is
-        # re-drawn on the canvas as well.
-        try:
-            import tkinter as tk  # lazy import
-            from theme_manager import draw_band_texture
-            self._draw_band_texture = draw_band_texture
-            self.footer_canvas = tk.Canvas(
-                self.footer_frame, bg=self.BRAND_NAVY,
-                highlightthickness=0, borderwidth=0, bd=0,
-            )
-            self.footer_canvas.place(relx=0.0, rely=0.0, relwidth=1.0, relheight=1.0)
-            self.footer_canvas.lift(self.copyright_label)
-            self.footer_frame.bind("<Configure>", self._repaint_footer)
-            self.footer_frame.after_idle(self._repaint_footer)
-        except Exception:
-            self.footer_canvas = None
-
-    def _repaint_footer(self, event=None):
-        """Repaint Verge texture + centered copyright on the footer canvas."""
-        canvas = getattr(self, "footer_canvas", None)
-        painter = getattr(self, "_draw_band_texture", None)
-        if canvas is None or painter is None:
-            return
-        try:
-            canvas.delete("band_text")
-            painter(canvas, "footer")
-            width = int(canvas.winfo_width())
-            height = int(canvas.winfo_height())
-            text = getattr(self, "_footer_text", "")
-            if width > 2 and height > 2 and text:
-                canvas.create_text(
-                    width / 2, height / 2, text=text,
-                    font=("Segoe UI", 8), fill="#c7cbe0",
-                    tags=("band_text",),
-                )
-        except Exception:
-            pass
     
     def update_button_text(self):
         """Update toggle button text ONLY - never change header colors."""
@@ -265,10 +185,9 @@ class FixedHeaderManager:
             self.theme_toggle_btn.configure(text=new_text)
         
         if self.copyright_label and self.theme_manager:
-            new_text = self.theme_manager.get_copyright_text()
-            self.copyright_label.configure(text=new_text)
-            self._footer_text = new_text
-            self._repaint_footer()
+            self.copyright_label.configure(
+                text=self.theme_manager.get_copyright_text()
+            )
     
     def update_for_theme(self, colors):
         """
