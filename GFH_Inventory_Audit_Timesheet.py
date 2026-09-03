@@ -3121,15 +3121,50 @@ class GFHApp(tk.Tk):
         except Exception:
             pass
 
-        # The "status_completed" (default/no-status) row tag was set once at
-        # startup using whatever COLOR_CARD was then — re-apply it now so
-        # already-populated rows update to the new theme's background instead
-        # of staying stuck white after a toggle.
-        if hasattr(self, "status_tree"):
-            try:
-                self.status_tree.tag_configure("status_completed", background=self.COLOR_CARD)
-            except Exception:
-                pass
+        # Row-highlight tags for the Inventory Audit Status and Variance Audit
+        # tables MUST follow the active theme. Previously only "status_completed"
+        # was re-applied here, so pending/sent/cleared rows kept their light
+        # pastel backgrounds and looked like light-theme panels inside the dark
+        # theme. _apply_row_tag_colors() re-themes ALL of them.
+        self._apply_row_tag_colors()
+
+    def _apply_row_tag_colors(self) -> None:
+        """Theme-aware row highlight colors for the two audit tables.
+
+        Light theme keeps the classic pastel highlights:
+            yellow = pending, blue = sent / completed-after-update, green = cleared.
+        Dark theme swaps them for muted dark tints of the same families with
+        light text, so populated rows render as dark-theme panels instead of
+        light-theme ones.
+        """
+        dark = getattr(self.theme_manager, "current_theme", "dark") == "dark"
+        if dark:
+            pending   = ("#3a3117", "#ffd66e")   # dark yellow tint
+            sent      = ("#16324f", "#9ecbff")   # dark blue tint
+            cleared   = ("#17331f", "#8fe3a8")   # dark green tint
+        else:
+            pending   = ("#FFF3CD", "#111827")
+            sent      = ("#D7ECFF", "#111827")
+            cleared   = ("#D9F7DF", "#111827")
+        normal_bg = getattr(self, "COLOR_CARD", None) or ("#141b38" if dark else "#ffffff")
+        normal_fg = getattr(self, "COLOR_TEXT", None) or ("#e8ecf7" if dark else "#111827")
+        try:
+            if hasattr(self, "status_tree"):
+                self.status_tree.tag_configure("status_pending", background=pending[0], foreground=pending[1])
+                self.status_tree.tag_configure("status_completed_after_update", background=sent[0], foreground=sent[1])
+                self.status_tree.tag_configure("status_completed_sent", background=cleared[0], foreground=cleared[1])
+                # "status_completed" (no special status yet) looks like a normal,
+                # un-highlighted row — it tracks the current theme's card/list colors.
+                self.status_tree.tag_configure("status_completed", background=normal_bg, foreground=normal_fg)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "audit_tree"):
+                self.audit_tree.tag_configure("variance_pending", background=pending[0], foreground=pending[1])
+                self.audit_tree.tag_configure("variance_sent", background=sent[0], foreground=sent[1])
+                self.audit_tree.tag_configure("variance_cleared", background=cleared[0], foreground=cleared[1])
+        except Exception:
+            pass
     def _build_status_tab(self) -> None:
         controls = ttk.LabelFrame(self.status_tab, text="Send Inventory Audit Status", padding=10)
         controls.pack(fill="x", pady=(0, 5))
@@ -3182,14 +3217,10 @@ class GFHApp(tk.Tk):
             self.status_tree.heading(col, text=headings[col], command=lambda c=col: self.sort_any_tree(self.status_tree, c, False))
             self.status_tree.column(col, width=widths[col], minwidth=80, anchor="w")
         self.status_tree.column("checkbox", anchor="center")
-        self.status_tree.tag_configure("status_pending", background="#FFF3CD", foreground="#111827")
-        self.status_tree.tag_configure("status_completed_after_update", background="#D7ECFF", foreground="#111827")
-        self.status_tree.tag_configure("status_completed_sent", background="#D9F7DF", foreground="#111827")
-        # "status_completed" (no special status yet) is meant to look like a normal,
-        # un-highlighted row — it should track the current theme's card/list
-        # background, not stay hardcoded white. It's re-applied in _apply_theme()
-        # too, so it stays correct after a theme toggle rather than only at startup.
-        self.status_tree.tag_configure("status_completed", background=self.COLOR_CARD)
+        # Row tag colors are theme-aware and (re-)applied by
+        # _apply_row_tag_colors() — here AND on every theme toggle — so rows
+        # no longer render with light-theme pastels inside the dark theme.
+        self._apply_row_tag_colors()
         ttk.Label(
             self.status_tab,
             text="Colors: Yellow = Pending, Blue = Completed after updated sheet load, Green = Completed and sent to WhatsApp.",
@@ -3284,9 +3315,9 @@ class GFHApp(tk.Tk):
             self.audit_tree.heading(col, text=headings[col], command=lambda c=col: self.sort_any_tree(self.audit_tree, c, False))
             self.audit_tree.column(col, width=widths[col], minwidth=80, anchor="w")
         self.audit_tree.column("checkbox", anchor="center")
-        self.audit_tree.tag_configure("variance_pending", background="#FFF3CD", foreground="#111827")
-        self.audit_tree.tag_configure("variance_sent", background="#D7ECFF", foreground="#111827")
-        self.audit_tree.tag_configure("variance_cleared", background="#D9F7DF", foreground="#111827")
+        # Theme-aware row tags — same mechanism as the status tab (see
+        # _apply_row_tag_colors); re-applied on every theme toggle.
+        self._apply_row_tag_colors()
         ttk.Label(
             self.audit_tab,
             text="Colors: Yellow = Pending variance, Blue = Sent to WhatsApp, Green = Cleared.",

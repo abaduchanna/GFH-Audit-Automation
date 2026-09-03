@@ -17,6 +17,7 @@ jobs:
       matrix:
         app:
           - GFH_Audit_Automation
+          - GFH_Inventory_Audit_Timesheet
 
     steps:
       - name: Checkout
