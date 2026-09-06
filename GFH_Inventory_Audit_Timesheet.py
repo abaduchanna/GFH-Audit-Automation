@@ -1517,6 +1517,14 @@ class VarianceDatabase:
                 )
             """)
 
+            # Portal credentials (B2B Soft + Timesheet) — base64-obfuscated passwords
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS portal_credentials (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL DEFAULT ''
+                )
+            """)
+
     def get_created_by_mappings(self) -> List[Dict[str, str]]:
         """Return all created_by → employee mappings."""
         with self.connect() as con:
@@ -1536,6 +1544,50 @@ class VarianceDatabase:
     def delete_created_by_mapping(self, created_by: str) -> None:
         with self.connect() as con:
             con.execute("DELETE FROM created_by_mappings WHERE created_by=?", (created_by,))
+
+    # ── Portal credential helpers ────────────────────────────────────────────
+    @staticmethod
+    def _obf_cred(v: str) -> str:
+        return base64.b64encode(v.encode()).decode() if v else ""
+
+    @staticmethod
+    def _deobf_cred(v: str) -> str:
+        if not v:
+            return ""
+        try:
+            return base64.b64decode(v.encode()).decode()
+        except Exception:
+            return v  # legacy plain-text tolerance
+
+    def save_portal_credentials(self, data: dict) -> None:
+        """Save portal credentials to the SQLite DB (passwords base64-obfuscated)."""
+        rows = []
+        for section, fields in data.items():
+            for field, value in fields.items():
+                key = f"{section}.{field}"
+                stored = self._obf_cred(value) if field == "password" else (value or "")
+                rows.append((key, stored))
+        with self.connect() as con:
+            for key, val in rows:
+                con.execute(
+                    "INSERT INTO portal_credentials(key, value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, val),
+                )
+
+    def load_portal_credentials(self) -> dict:
+        """Load portal credentials from SQLite, returning a nested dict."""
+        with self.connect() as con:
+            rows = con.execute("SELECT key, value FROM portal_credentials").fetchall()
+        result: dict = {}
+        for key, val in rows:
+            if "." not in key:
+                continue
+            section, field = key.split(".", 1)
+            result.setdefault(section, {})[field] = (
+                self._deobf_cred(val) if field == "password" else val
+            )
+        return result
 
     def resolve_employee_for_created_by(self, created_by: str) -> Dict[str, str]:
         """Return {employee_name, phone} for a given Created By value, or empty strings."""
@@ -2625,61 +2677,9 @@ def show_startup_error(exc: BaseException) -> None:
 GFH_SQUARE_ICON_B64 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "gfh_square_icon_b64.txt"), "r").read().strip() if not getattr(sys, "frozen", False) else open(os.path.join(getattr(sys, "_MEIPASS", "."), "assets", "gfh_square_icon_b64.txt"), "r").read().strip()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Portal Credential Store
-# ─────────────────────────────────────────────────────────────────────────────
-class PortalCredentialStore:
-    """Thread-safe credential storage with base64 obfuscation.
-
-    Saved to <APP_DIR>/portal_credentials.json with restricted permissions.
-    Passwords are base64-obfuscated (not encrypted, but not plain-text).
-    """
-    FILENAME = "portal_credentials.json"
-    _lock = threading.Lock()
-
-    def __init__(self, app_dir: Path):
-        self.path = Path(app_dir) / self.FILENAME
-
-    @staticmethod
-    def _obf(v: str) -> str:
-        return base64.b64encode(v.encode()).decode() if v else ""
-
-    @staticmethod
-    def _deobf(v: str) -> str:
-        if not v:
-            return ""
-        try:
-            return base64.b64decode(v.encode()).decode()
-        except Exception:
-            return v  # legacy plain-text tolerance
-
-    def load(self) -> dict:
-        with self._lock:
-            if not self.path.exists():
-                return {}
-            try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-                # Deobfuscate passwords
-                for section in ("brs", "timesheet"):
-                    if section in raw:
-                        raw[section]["password"] = self._deobf(raw[section].get("password", ""))
-                return raw
-            except Exception:
-                return {}
-
-    def save(self, data: dict) -> None:
-        with self._lock:
-            out = {k: dict(v) for k, v in data.items()}
-            for section in ("brs", "timesheet"):
-                if section in out:
-                    out[section]["password"] = self._obf(out[section].get("password", ""))
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
-            try:
-                if os.name == "posix":
-                    os.chmod(self.path, 0o600)
-            except Exception:
-                pass
+# PortalCredentialStore — credentials are now stored directly in the SQLite DB
+# via VarianceDatabase.save_portal_credentials / load_portal_credentials.
+# This stub is kept only so any legacy references don't break at import time.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3169,8 +3169,7 @@ class GFHApp(tk.Tk):
         self.time_sheet_path = tk.StringVar(value="")
         self.status_text = tk.StringVar(value="Select the Inventory_Count_Result_Details file, then click Load Variances. No data loaded yet.")
 
-        # ── Portal Credentials ──────────────────────────────────────────────
-        self._cred_store = PortalCredentialStore(APP_DIR)
+        # ── Portal Credentials (stored in the existing SQLite DB) ───────────
         self.brs_company_id_var = tk.StringVar(value="9909129")
         self.brs_account_id_var = tk.StringVar(value="")
         self.brs_username_var = tk.StringVar(value="")
@@ -3434,9 +3433,14 @@ class GFHApp(tk.Tk):
         header._tag = "header"
 
         self.header_logo_img = None
-        if HEADER_LOGO_PATH.exists() and Image is not None and ImageTk is not None:
+        if Image is not None and ImageTk is not None:
             try:
-                logo = Image.open(HEADER_LOGO_PATH).convert("RGBA")
+                # Prefer the file on disk; fall back to the embedded base64 logo
+                if HEADER_LOGO_PATH.exists():
+                    logo = Image.open(HEADER_LOGO_PATH).convert("RGBA")
+                else:
+                    import io as _io
+                    logo = Image.open(_io.BytesIO(base64.b64decode(EMBEDDED_LOGO_B64))).convert("RGBA")
                 scale = min(190 / logo.width, 72 / logo.height)
                 size = (max(1, int(logo.width * scale)), max(1, int(logo.height * scale)))
                 logo = logo.resize(size, Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.ANTIALIAS)
@@ -3483,17 +3487,7 @@ class GFHApp(tk.Tk):
         root = ttk.Frame(self, padding=14)
         root.pack(fill="both", expand=True)
 
-        file_box = ttk.LabelFrame(root, text="Upload Files", padding=10)
-        file_box.pack(fill="x", pady=(12, 8))
-        self._file_row(file_box, 0, "Inventory_Count_Result_Details", self.inventory_path, self.pick_inventory)
-        self._file_row(file_box, 1, "Timesheet (timesheets_*.xlsx)", self.time_sheet_path, self.pick_time_sheet)
-        ttk.Button(file_box, text="Load Variances", command=self.load_variances).grid(row=0, column=3, rowspan=2, padx=(12, 0), sticky="ns")
-        # + / − zoom buttons stacked vertically (+ on top, − on bottom)
-        zoom_frame = ttk.Frame(file_box)
-        zoom_frame.grid(row=0, column=4, rowspan=2, padx=(8, 0), sticky="ns")
-        ttk.Button(zoom_frame, text="+", width=3, command=self.zoom_in).pack(fill="x", pady=(0, 2))
-        ttk.Button(zoom_frame, text="−", width=3, command=self.zoom_out).pack(fill="x")
-        file_box.columnconfigure(1, weight=1)
+        # Zoom keybindings (zoom buttons remain in the header area)
         self.bind("<Control-equal>", self.zoom_in)
         self.bind("<Control-plus>", self.zoom_in)
         self.bind("<Control-minus>", self.zoom_out)
@@ -3596,14 +3590,14 @@ class GFHApp(tk.Tk):
             },
         }
         try:
-            self._cred_store.save(data)
-            messagebox.showinfo("Saved", "Portal credentials saved.", parent=self)
+            self.db.save_portal_credentials(data)
+            messagebox.showinfo("Saved", "Portal credentials saved to database.", parent=self)
         except Exception as exc:
             messagebox.showerror("Save Error", str(exc), parent=self)
 
     def _load_saved_credentials(self) -> None:
         try:
-            data = self._cred_store.load()
+            data = self.db.load_portal_credentials()
             brs = data.get("brs", {})
             self.brs_company_id_var.set(brs.get("company_id", "9909129") or "9909129")
             self.brs_account_id_var.set(brs.get("account_id", "") or "")
@@ -3660,19 +3654,12 @@ class GFHApp(tk.Tk):
 
         # Info banner
         info = ttk.Label(tab, text=(
-            "Set a start time per district (HH:MM, 24h). Leave blank to start immediately when Start is clicked.\n"
-            "After start time: sends the Starting WhatsApp message to the district group.\n"
-            "Every 15 minutes: auto-exports B2B count sheet + Timesheet, reloads variances, sends inventory status.\n"
-            "The scheduler keeps running until all districts complete or you click Stop."
+            "Set a start time per district (HH:MM, 24h). Leave blank to trigger immediately when Start is clicked.\n"
+            "On start time: sends the Starting WhatsApp message to that district's group.\n"
+            "Every 15 minutes: auto-exports B2B count sheet + Timesheet, reloads variances, and sends inventory status.\n"
+            "Districts are pulled from the Store List tab. Add credentials in the Portal Credentials tab first."
         ), wraplength=950, justify="left")
         info.pack(anchor="w", pady=(0, 8))
-
-        # Auto-import button
-        import_row = ttk.Frame(tab)
-        import_row.pack(fill="x", pady=(0, 8))
-        ttk.Button(import_row, text="⟳  Auto-Import Districts & Stores from Inventory",
-                   command=self._auto_import_stores_from_inventory).pack(side="left", padx=(0, 8))
-        ttk.Label(import_row, text="(imports store list from the loaded inventory count file)").pack(side="left")
 
         # District time input grid
         self._sched_frame = ttk.LabelFrame(tab, text="District Start Times", padding=10)
