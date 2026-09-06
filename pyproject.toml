@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gfh-inventory-audit"
+version = "1.0.0"
+description = "GFH Inventory Audit + Timesheet automation"
+requires-python = ">=3.11"
+authors = [
+    { name = "Abad Umair Channa" }
+]
+license = { text = "Proprietary" }
+readme = "README.md"
+
+[tool.setuptools]
+packages = ["."]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
