@@ -172,8 +172,18 @@ except Exception as exc:
     raise RuntimeError("openpyxl is required. Install with: py -m pip install openpyxl") from exc
 
 APP_NAME = "GFH Telecom LLC Inventory Audit"
-EMBEDDED_LOGO_B64 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "embedded_logo_b64.txt"), "r").read().strip() if not getattr(sys, "frozen", False) else open(os.path.join(getattr(sys, "_MEIPASS", "."), "assets", "embedded_logo_b64.txt"), "r").read().strip()
-EMBEDDED_ICON_B64 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "embedded_icon_b64.txt"), "r").read().strip() if not getattr(sys, "frozen", False) else open(os.path.join(getattr(sys, "_MEIPASS", "."), "assets", "embedded_icon_b64.txt"), "r").read().strip()
+def _safe_read_asset(filename: str, default: str = "") -> str:
+    try:
+        if getattr(sys, "frozen", False):
+            base = getattr(sys, "_MEIPASS", ".")
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        return open(os.path.join(base, "assets", filename), "r").read().strip()
+    except Exception:
+        return default
+
+EMBEDDED_LOGO_B64 = _safe_read_asset("embedded_logo_b64.txt")
+EMBEDDED_ICON_B64 = _safe_read_asset("embedded_icon_b64.txt")
 
 if getattr(sys, "frozen", False):
     PACKAGE_DIR = Path(sys.executable).resolve().parent
@@ -2674,12 +2684,418 @@ def show_startup_error(exc: BaseException) -> None:
         print(error_text)
 
 
-GFH_SQUARE_ICON_B64 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "gfh_square_icon_b64.txt"), "r").read().strip() if not getattr(sys, "frozen", False) else open(os.path.join(getattr(sys, "_MEIPASS", "."), "assets", "gfh_square_icon_b64.txt"), "r").read().strip()
+GFH_SQUARE_ICON_B64 = _safe_read_asset("gfh_square_icon_b64.txt")
 
 
 # PortalCredentialStore — credentials are now stored directly in the SQLite DB
 # via VarianceDatabase.save_portal_credentials / load_portal_credentials.
 # This stub is kept only so any legacy references don't break at import time.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Human / Cloudflare / reCAPTCHA verification helpers
+# (ported from VidaPay workflow — used by B2BSoftScraper)
+# ─────────────────────────────────────────────────────────────────────────────
+def _b2b_is_human_verification_page(driver) -> bool:
+    """Return True if Cloudflare or reCAPTCHA challenge is currently shown."""
+    try:
+        return bool(driver.execute_script("""
+            const t = (document.body.innerText || '').toLowerCase();
+            if (t.includes('verify you are human') || t.includes('verify human')) return true;
+            if (t.includes('performing security verification'))                   return true;
+            if (t.includes('just a moment') &&
+                document.title.toLowerCase().includes('just a moment'))           return true;
+            if (document.querySelector('#BbLB6'))                                 return true;
+            if (document.querySelector('#challenge-stage'))                       return true;
+            if (document.querySelector('.cf-turnstile'))                          return true;
+            if (document.querySelector('[name="cf-turnstile-response"]'))         return true;
+            if (document.querySelector('input[id*="cf-chl-widget"]'))             return true;
+            if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
+            if (document.querySelector('iframe[src*="recaptcha/api2/anchor"]') ||
+                document.querySelector('iframe[src*="recaptcha/enterprise/anchor"]')) return true;
+            return false;
+        """))
+    except Exception:
+        return False
+
+
+def _b2b_pyautogui_click_turnstile(driver, log=print) -> bool:
+    """Click the Cloudflare Turnstile checkbox using pyautogui OS-level click.
+    The widget iframe sits inside a CLOSED shadow root, unreachable by JS/CSS
+    selectors, so we locate its host element by stable 300×65 geometry and
+    click ~22 px from the left edge (where the checkbox lives)."""
+    try:
+        import pyautogui as _pg
+    except ImportError:
+        log("  pyautogui not available — cannot click Turnstile.")
+        return False
+
+    def _offsets():
+        return driver.execute_script("""
+            return {
+                sx: window.screenX !== undefined ? window.screenX : (window.screenLeft || 0),
+                sy: window.screenY !== undefined ? window.screenY : (window.screenTop  || 0),
+                ch: (window.outerHeight - window.innerHeight) || 0
+            };
+        """)
+
+    def _do_click(cx, cy, label=""):
+        log(f"  pyautogui click at ({cx}, {cy}){' — ' + label if label else ''}…")
+        try:
+            _pg.moveTo(cx, cy, duration=0.3)
+            time.sleep(0.15)
+            _pg.click()
+            time.sleep(0.35)
+            _pg.click()
+            return True
+        except Exception as e:
+            log(f"  pyautogui error: {e}")
+            return False
+
+    def _cleared():
+        try:
+            time.sleep(2)
+            return not bool(driver.execute_script("""
+                const t = (document.body.innerText || '').toLowerCase();
+                return (t.includes('verify you are human') ||
+                        t.includes('performing security verification') ||
+                        t.includes('just a moment'));
+            """))
+        except Exception:
+            return False
+
+    time.sleep(2.5)
+    rect = None
+    for _tick in range(15):
+        try:
+            rect = driver.execute_script("""
+                const cfInput = document.querySelector(
+                    '[name="cf-turnstile-response"], input[id*="cf-chl-widget"]');
+                if (cfInput) {
+                    let el = cfInput.parentElement;
+                    for (let i = 0; i < 6 && el; i++) {
+                        const r = el.getBoundingClientRect();
+                        if (r.width >= 250 && r.width <= 380 &&
+                            r.height >= 45 && r.height <= 110 &&
+                            (r.top > 0 || r.left > 0))
+                            return {left:r.left, top:r.top, width:r.width, height:r.height};
+                        el = el.parentElement;
+                    }
+                }
+                const all = document.querySelectorAll('div');
+                for (const el of all) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 280 && r.width <= 320 && r.height >= 55 && r.height <= 75) {
+                        const txt = (el.innerText || '').toLowerCase();
+                        if (txt.includes('verify you are human') || txt.includes('verify'))
+                            return {left:r.left, top:r.top, width:r.width, height:r.height};
+                    }
+                }
+                return null;
+            """)
+            if rect:
+                log(f"  Turnstile widget found at tick {_tick+1}.")
+                break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    if not rect:
+        log("  Turnstile widget not found — blind-click fallback.")
+        try:
+            pw = driver.execute_script("return window.innerWidth;")
+            ph = driver.execute_script("return window.innerHeight;")
+            o = _offsets()
+            for fx, fy in [(0.5, 0.45), (0.5, 0.50), (0.5, 0.55)]:
+                cx = int(o['sx'] + pw * fx - 128)
+                cy = int(o['sy'] + o['ch'] + ph * fy)
+                if _do_click(cx, cy) and _cleared():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    o = _offsets()
+    cy = int(o['sy'] + o['ch'] + rect['top'] + rect['height'] / 2)
+    for x_off in [22, 16, 30, 12, 40]:
+        cx = int(o['sx'] + rect['left'] + x_off)
+        if _do_click(cx, cy, f"x_off={x_off}") and _cleared():
+            return True
+        time.sleep(0.6)
+
+    log("  Turnstile click exhausted all offsets.")
+    return False
+
+
+def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
+    """Solve reCAPTCHA v2 via Google STT audio challenge (with Whisper fallback)."""
+    import shutil, subprocess, tempfile
+    try:
+        import speech_recognition as sr
+    except ImportError:
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "SpeechRecognition",
+                            "--quiet", "--disable-pip-version-check"], capture_output=True, timeout=90)
+            import speech_recognition as sr
+        except Exception:
+            log("  SpeechRecognition not available — cannot solve reCAPTCHA audio.")
+            return False
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        log("  ffmpeg not found — cannot convert audio for reCAPTCHA.")
+        return False
+
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    try:
+        driver.switch_to.default_content()
+
+        # Find anchor iframe
+        anchor = None
+        for sel in ["iframe[src*='recaptcha/api2/anchor']",
+                    "iframe[src*='recaptcha/enterprise/anchor']",
+                    "iframe[title*='reCAPTCHA']"]:
+            try:
+                anchor = driver.find_element(By.CSS_SELECTOR, sel)
+                break
+            except Exception:
+                pass
+        if not anchor:
+            log("  reCAPTCHA anchor iframe not found.")
+            return False
+
+        driver.switch_to.frame(anchor)
+        try:
+            cb = driver.find_element(By.ID, "recaptcha-anchor")
+            if driver.execute_script("return arguments[0].getAttribute('aria-checked');", cb) != "true":
+                cb.click()
+                log("  reCAPTCHA checkbox clicked.")
+                time.sleep(2)
+        except Exception:
+            pass
+        driver.switch_to.default_content()
+        time.sleep(1.5)
+
+        # Find bframe
+        bframe = None
+        for sel in ["iframe[src*='recaptcha/api2/bframe']",
+                    "iframe[src*='recaptcha/enterprise/bframe']",
+                    "iframe[title*='recaptcha challenge']"]:
+            try:
+                bframe = driver.find_element(By.CSS_SELECTOR, sel)
+                break
+            except Exception:
+                pass
+        if not bframe:
+            log("  reCAPTCHA bframe not found.")
+            return False
+
+        driver.switch_to.frame(bframe)
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((By.ID, "recaptcha-audio-button"))
+            ).click()
+            log("  Audio button clicked.")
+            time.sleep(2)
+        except Exception as e:
+            log(f"  Audio button error: {e}")
+            driver.switch_to.default_content()
+            return False
+
+        # Audio challenge loop (up to 3 cycles)
+        BFRAME_SELS = ["iframe[src*='recaptcha/api2/bframe']",
+                       "iframe[src*='recaptcha/enterprise/bframe']",
+                       "iframe[title*='recaptcha challenge']"]
+
+        def _find_bframe():
+            driver.switch_to.default_content()
+            for sel in BFRAME_SELS:
+                try:
+                    return driver.find_element(By.CSS_SELECTOR, sel)
+                except Exception:
+                    pass
+            return None
+
+        submitted = False
+        for cycle in range(3):
+            if cycle > 0:
+                _bf = _find_bframe()
+                if not _bf:
+                    break
+                driver.switch_to.frame(_bf)
+                try:
+                    WebDriverWait(driver, 6).until(
+                        EC.element_to_be_clickable((By.ID, "recaptcha-reload-button"))
+                    ).click()
+                    log(f"  Audio reloaded (cycle {cycle+1}).")
+                    time.sleep(2.5)
+                except Exception:
+                    driver.switch_to.default_content()
+                    break
+                driver.switch_to.default_content()
+
+            _bf2 = _find_bframe()
+            if not _bf2:
+                break
+            driver.switch_to.frame(_bf2)
+            time.sleep(1)
+            mp3_url = None
+            try:
+                mp3_url = driver.find_element(
+                    By.CSS_SELECTOR, "a.rc-audiochallenge-tdownload-link"
+                ).get_attribute("href")
+            except Exception:
+                pass
+            if not mp3_url:
+                try:
+                    mp3_url = driver.find_element(
+                        By.CSS_SELECTOR, "audio#audio-source, audio source"
+                    ).get_attribute("src")
+                except Exception:
+                    pass
+            driver.switch_to.default_content()
+            if not mp3_url:
+                continue
+
+            transcript = None
+            with tempfile.TemporaryDirectory() as tmp:
+                import os as _os
+                mp3 = _os.path.join(tmp, "c.mp3")
+                wav = _os.path.join(tmp, "c.wav")
+                try:
+                    import urllib.request as _ur
+                    _ur.urlretrieve(mp3_url, mp3)
+                    subprocess.run([ffmpeg, "-y", "-i", mp3, "-ar", "16000", "-ac", "1", wav],
+                                   capture_output=True, timeout=30)
+                    rec = sr.Recognizer()
+                    with sr.AudioFile(wav) as _src:
+                        _audio = rec.record(_src)
+                    transcript = rec.recognize_google(_audio)
+                    log(f"  STT result: '{transcript}'")
+                except Exception as e:
+                    log(f"  STT failed (cycle {cycle+1}): {e}")
+
+            if not transcript:
+                continue
+
+            _bf3 = _find_bframe()
+            if not _bf3:
+                break
+            driver.switch_to.frame(_bf3)
+            try:
+                inp = WebDriverWait(driver, 8).until(
+                    EC.presence_of_element_located((By.ID, "audio-response"))
+                )
+                inp.clear()
+                inp.send_keys(transcript.lower().strip())
+                time.sleep(0.4)
+                driver.find_element(By.ID, "recaptcha-verify-button").click()
+                log(f"  reCAPTCHA answer submitted (cycle {cycle+1}).")
+                time.sleep(2.5)
+                submitted = True
+            except Exception as e:
+                log(f"  Answer submit error: {e}")
+            driver.switch_to.default_content()
+            if submitted:
+                break
+
+        driver.switch_to.default_content()
+        return submitted
+
+    except Exception as e:
+        log(f"  reCAPTCHA solver error: {e}")
+        try:
+            driver.switch_to.default_content()
+        except Exception:
+            pass
+        return False
+
+
+def _b2b_try_auto_click_human_verification(driver, log=print) -> bool:
+    """Detect verification type (Cloudflare vs reCAPTCHA) and dispatch."""
+    from selenium.webdriver.common.by import By
+    is_cf = False
+    try:
+        is_cf = bool(driver.execute_script("""
+            if (document.querySelector('[name="cf-turnstile-response"]'))           return true;
+            if (document.querySelector('input[id*="cf-chl-widget"]'))               return true;
+            if (document.querySelector('.cf-turnstile'))                            return true;
+            if (document.querySelector('iframe[src*="challenges.cloudflare.com"]')) return true;
+            if (document.querySelector('#challenge-stage'))                         return true;
+            const t = (document.body.innerText || '').toLowerCase();
+            if (t.includes('performing security verification'))                     return true;
+            if (t.includes('just a moment') &&
+                document.title.toLowerCase().includes('just a moment'))             return true;
+            return false;
+        """))
+    except Exception:
+        pass
+
+    if is_cf:
+        log("Cloudflare Turnstile detected — using pyautogui click.")
+        return _b2b_pyautogui_click_turnstile(driver, log=log)
+
+    # reCAPTCHA
+    for sel in ["iframe[src*='recaptcha/api2/anchor']",
+                "iframe[src*='recaptcha/enterprise/anchor']",
+                "iframe[title*='reCAPTCHA']"]:
+        try:
+            driver.find_element(By.CSS_SELECTOR, sel)
+            log("reCAPTCHA detected — running audio solver.")
+            return _b2b_try_solve_recaptcha(driver, log=log)
+        except Exception:
+            pass
+
+    return False
+
+
+def _b2b_wait_for_human_verification_clear(driver, stop_event=None, timeout: int = 120, log=print) -> bool:
+    """Wait for any Cloudflare/reCAPTCHA challenge to pass, auto-solving if possible."""
+    if not _b2b_is_human_verification_page(driver):
+        return True
+    log("Human verification detected on B2B portal.")
+
+    # Check for managed challenge (auto-resolves itself)
+    try:
+        is_managed = bool(driver.execute_script("""
+            const t = (document.body.innerText || '').toLowerCase();
+            return t.includes('performing security verification') ||
+                   (t.includes('just a moment') && document.title.toLowerCase().includes('just a moment'));
+        """))
+    except Exception:
+        is_managed = False
+
+    if is_managed:
+        log("  Managed challenge — waiting up to 15s for auto-resolve…")
+        for _ in range(15):
+            time.sleep(1)
+            if not _b2b_is_human_verification_page(driver):
+                log("  Managed challenge resolved. Continuing.")
+                return True
+        log("  Managed challenge still present — trying click strategies.")
+
+    for cycle in range(3):
+        if stop_event is not None and stop_event.is_set():
+            return False
+        log(f"  Verification cycle {cycle+1}/3…")
+        if _b2b_try_auto_click_human_verification(driver, log=log):
+            for _ in range(10):
+                time.sleep(1)
+                if not _b2b_is_human_verification_page(driver):
+                    log("  Verification cleared.")
+                    return True
+            log(f"  Cycle {cycle+1}: still showing after click.")
+        else:
+            log(f"  Cycle {cycle+1}: no click delivered.")
+        if cycle < 2:
+            time.sleep(5)
+            if not _b2b_is_human_verification_page(driver):
+                return True
+    log("Verification did not clear after 3 cycles.")
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2737,10 +3153,18 @@ class B2BSoftScraper:
             except Exception as exc:
                 raise RuntimeError(f"Could not start Edge or Chrome WebDriver: {exc}")
 
-    def login(self) -> bool:
+    def login(self, stop_event=None) -> bool:
+        """Full B2B login with Cloudflare Turnstile + reCAPTCHA + 2FA support.
+
+        Flow:
+            Open portal → [verification?] → Step 1 Company ID → [verification?]
+            → Step 2 Account ID → Step 3 Username + Password → [verification?]
+            → confirm authenticated
+        """
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
+
         if not all([self.company_id, self.account_id, self.username, self.password]):
             raise RuntimeError("B2B credentials incomplete — fill Portal Credentials tab.")
         if self.driver is None:
@@ -2749,38 +3173,75 @@ class B2BSoftScraper:
         self.log(f"Opening {self.PORTAL_URL}")
         self.driver.get(self.PORTAL_URL)
         time.sleep(2)
-        wait = WebDriverWait(self.driver, 25)
-        # Step 1: Company ID
+
+        # Clear any initial verification challenge
+        if _b2b_is_human_verification_page(self.driver):
+            if not _b2b_wait_for_human_verification_clear(self.driver, stop_event=stop_event, log=self.log):
+                raise RuntimeError("Cloudflare/reCAPTCHA challenge on landing page was not resolved.")
+
+        wait = WebDriverWait(self.driver, 30)
+
+        # ── Step 1: Company ID ─────────────────────────────────────────────
         try:
             f = wait.until(EC.presence_of_element_located((By.ID, "companyId")))
-            f.clear(); f.send_keys(self.company_id)
-            self.log(f"Company ID: {self.company_id}")
+            f.clear()
+            f.send_keys(self.company_id)
+            self.log(f"Company ID entered: {self.company_id}")
             wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit"))).click()
             time.sleep(2)
         except Exception as e:
             raise RuntimeError(f"B2B Step 1 (Company ID) failed: {e}")
-        # Step 2: Account ID
+
+        # Verification may appear after submitting Company ID
+        if _b2b_is_human_verification_page(self.driver):
+            if not _b2b_wait_for_human_verification_clear(self.driver, stop_event=stop_event, log=self.log):
+                raise RuntimeError("Verification challenge after Company ID was not resolved.")
+
+        # ── Step 2: Account ID ─────────────────────────────────────────────
         try:
             f = wait.until(EC.presence_of_element_located((By.ID, "AccountId")))
-            f.clear(); f.send_keys(self.account_id)
-            self.log(f"Account ID: {self.account_id}")
+            f.clear()
+            f.send_keys(self.account_id)
+            self.log(f"Account ID entered: {self.account_id}")
             time.sleep(1)
         except Exception as e:
             raise RuntimeError(f"B2B Step 2 (Account ID) failed: {e}")
-        # Step 3: Username + Password
+
+        # ── Step 3: Username + Password ────────────────────────────────────
         try:
             u = wait.until(EC.presence_of_element_located((By.ID, "Username")))
-            p = self.driver.find_element(By.ID, "Password")
-            u.clear(); u.send_keys(self.username)
-            p.clear(); p.send_keys(self.password)
-            self.log(f"Username: {self.username}")
-            wait.until(EC.element_to_be_clickable((By.ID, "btnClick"))).click()
+            u.clear()
+            u.send_keys(self.username)
+            self.log(f"Username entered: {self.username}")
+            p = wait.until(EC.presence_of_element_located((By.ID, "Password")))
+            p.clear()
+            p.send_keys(self.password)
+            # Click Sign In / #btnClick
+            for _sel in [(By.ID, "btnClick"),
+                         (By.XPATH, "//button[contains(normalize-space(),'Sign In')]"),
+                         (By.XPATH, "//button[contains(normalize-space(),'Login')]"),
+                         (By.XPATH, "//input[@type='submit']")]:
+                try:
+                    btn = wait.until(EC.element_to_be_clickable(_sel))
+                    btn.click()
+                    self.log("Login button clicked.")
+                    break
+                except Exception:
+                    continue
             time.sleep(3)
         except Exception as e:
             raise RuntimeError(f"B2B Step 3 (Username/Password) failed: {e}")
-        # Verify
-        deadline = time.time() + 35
+
+        # Verification may appear after login submit
+        if _b2b_is_human_verification_page(self.driver):
+            if not _b2b_wait_for_human_verification_clear(self.driver, stop_event=stop_event, log=self.log):
+                raise RuntimeError("Verification challenge after login submit was not resolved.")
+
+        # ── Confirm authentication ─────────────────────────────────────────
+        deadline = time.time() + 40
         while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("Login cancelled by stop event.")
             if self._is_authed():
                 self.log("✓ B2B login successful")
                 return True
@@ -3434,22 +3895,33 @@ class GFHApp(tk.Tk):
 
         self.header_logo_img = None
         if Image is not None and ImageTk is not None:
-            try:
-                # Prefer the file on disk; fall back to the embedded base64 logo
-                if HEADER_LOGO_PATH.exists():
-                    logo = Image.open(HEADER_LOGO_PATH).convert("RGBA")
-                else:
-                    import io as _io
-                    logo = Image.open(_io.BytesIO(base64.b64decode(EMBEDDED_LOGO_B64))).convert("RGBA")
-                scale = min(190 / logo.width, 72 / logo.height)
-                size = (max(1, int(logo.width * scale)), max(1, int(logo.height * scale)))
-                logo = logo.resize(size, Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.ANTIALIAS)
-                self.header_logo_img = ImageTk.PhotoImage(logo)
-                _logo_lbl = tk.Label(header, image=self.header_logo_img, bg=self.COLOR_NAVY, bd=0,
-                                     highlightthickness=0)
-                _logo_lbl.pack(side="left", padx=(18, 0), pady=9)
-                _logo_lbl._tag = "header"
-            except Exception:
+            import io as _io
+            _logo_loaded = False
+            for _logo_src in [
+                # 1: PNG file on disk
+                lambda: Image.open(HEADER_LOGO_PATH).convert("RGBA") if HEADER_LOGO_PATH.exists() else None,
+                # 2: embedded_logo_b64.txt asset
+                lambda: Image.open(_io.BytesIO(base64.b64decode(EMBEDDED_LOGO_B64))).convert("RGBA") if EMBEDDED_LOGO_B64 else None,
+                # 3: gfh_square_icon_b64.txt asset (fallback square icon)
+                lambda: Image.open(_io.BytesIO(base64.b64decode(GFH_SQUARE_ICON_B64))).convert("RGBA") if GFH_SQUARE_ICON_B64 else None,
+            ]:
+                try:
+                    logo = _logo_src()
+                    if logo is None:
+                        continue
+                    scale = min(190 / logo.width, 72 / logo.height)
+                    size = (max(1, int(logo.width * scale)), max(1, int(logo.height * scale)))
+                    logo = logo.resize(size, Image.LANCZOS if hasattr(Image, "LANCZOS") else Image.ANTIALIAS)
+                    self.header_logo_img = ImageTk.PhotoImage(logo)
+                    _logo_lbl = tk.Label(header, image=self.header_logo_img, bg=self.COLOR_NAVY, bd=0,
+                                         highlightthickness=0)
+                    _logo_lbl.pack(side="left", padx=(18, 0), pady=9)
+                    _logo_lbl._tag = "header"
+                    _logo_loaded = True
+                    break
+                except Exception:
+                    continue
+            if not _logo_loaded:
                 self.header_logo_img = None
 
         # Red vertical divider
@@ -3649,43 +4121,24 @@ class GFHApp(tk.Tk):
 
     # ── Audit Scheduler Tab ─────────────────────────────────────────────────
     def _build_scheduler_tab(self) -> None:
-        """Build the Audit Scheduler tab UI."""
+        """Scheduler controls are now on the Inventory Audit Status tab (main tab).
+        This tab shows a convenience redirect notice only."""
         tab = self.scheduler_tab
-
-        # Info banner
-        info = ttk.Label(tab, text=(
-            "Set a start time per district (HH:MM, 24h). Leave blank to trigger immediately when Start is clicked.\n"
-            "On start time: sends the Starting WhatsApp message to that district's group.\n"
-            "Every 15 minutes: auto-exports B2B count sheet + Timesheet, reloads variances, and sends inventory status.\n"
-            "Districts are pulled from the Store List tab. Add credentials in the Portal Credentials tab first."
-        ), wraplength=950, justify="left")
-        info.pack(anchor="w", pady=(0, 8))
-
-        # District time input grid
-        self._sched_frame = ttk.LabelFrame(tab, text="District Start Times", padding=10)
-        self._sched_frame.pack(fill="x", pady=(0, 10))
-        self._build_scheduler_district_rows()
-
-        # Control buttons
-        ctrl_row = ttk.Frame(tab)
-        ctrl_row.pack(fill="x", pady=(4, 8))
-        self._sched_start_btn = ttk.Button(ctrl_row, text="▶  Start",  command=self._sched_start)
-        self._sched_stop_btn  = ttk.Button(ctrl_row, text="■  Stop",   command=self._sched_stop)
-        self._sched_hold_btn  = ttk.Button(ctrl_row, text="⏸  Hold",   command=self._sched_hold)
-        self._sched_resume_btn= ttk.Button(ctrl_row, text="⏵  Resume", command=self._sched_resume)
-        for btn in (self._sched_start_btn, self._sched_stop_btn,
-                    self._sched_hold_btn, self._sched_resume_btn):
-            btn.pack(side="left", padx=(0, 8))
-
-        # Status log
-        log_frame = ttk.LabelFrame(tab, text="Scheduler Log", padding=8)
-        log_frame.pack(fill="both", expand=True, pady=(0, 0))
-        self._sched_log_text = tk.Text(log_frame, height=10, state="disabled",
-                                       wrap="word", relief="flat")
-        _sb = ttk.Scrollbar(log_frame, orient="vertical", command=self._sched_log_text.yview)
-        self._sched_log_text.configure(yscrollcommand=_sb.set)
-        self._sched_log_text.pack(side="left", fill="both", expand=True)
-        _sb.pack(side="right", fill="y")
+        ttk.Label(
+            tab,
+            text=(
+                "The Audit Scheduler controls have moved to the Inventory Audit Status tab.\n\n"
+                "Use the Start / Stop / Hold / Resume buttons and district time fields\n"
+                "at the top of that tab to control the scheduler."
+            ),
+            justify="left",
+            wraplength=700,
+        ).pack(anchor="nw", padx=20, pady=30)
+        ttk.Button(
+            tab,
+            text="Go to Inventory Audit Status →",
+            command=lambda: self.notebook.select(self.status_tab),
+        ).pack(anchor="nw", padx=20)
 
     def _build_scheduler_district_rows(self) -> None:
         """Build one row per known district with an HH:MM time-entry field."""
@@ -3995,6 +4448,39 @@ class GFHApp(tk.Tk):
             pass
 
     def _build_status_tab(self) -> None:
+        # ── Audit Scheduler panel (inline on main tab) ──────────────────────
+        sched_box = ttk.LabelFrame(self.status_tab, text="Audit Scheduler", padding=8)
+        sched_box.pack(fill="x", pady=(0, 6))
+
+        # Control buttons row
+        btn_row = ttk.Frame(sched_box)
+        btn_row.pack(fill="x", pady=(0, 6))
+        self._sched_start_btn  = ttk.Button(btn_row, text="▶  Start",  command=self._sched_start)
+        self._sched_stop_btn   = ttk.Button(btn_row, text="■  Stop",   command=self._sched_stop)
+        self._sched_hold_btn   = ttk.Button(btn_row, text="⏸  Hold",   command=self._sched_hold)
+        self._sched_resume_btn = ttk.Button(btn_row, text="⏵  Resume", command=self._sched_resume)
+        for btn in (self._sched_start_btn, self._sched_stop_btn,
+                    self._sched_hold_btn, self._sched_resume_btn):
+            btn.pack(side="left", padx=(0, 8))
+        ttk.Label(btn_row, text="  Start times per district (HH:MM, 24h):",
+                  foreground="#8090b0").pack(side="left", padx=(12, 4))
+
+        # District time inputs (compact, inline)
+        self._sched_frame = ttk.Frame(sched_box)
+        self._sched_frame.pack(fill="x")
+        self._build_scheduler_district_rows()
+
+        # Tiny status log
+        log_fr = ttk.Frame(sched_box)
+        log_fr.pack(fill="x", pady=(4, 0))
+        self._sched_log_text = tk.Text(log_fr, height=3, state="disabled",
+                                       wrap="word", relief="flat")
+        _sb = ttk.Scrollbar(log_fr, orient="vertical", command=self._sched_log_text.yview)
+        self._sched_log_text.configure(yscrollcommand=_sb.set)
+        self._sched_log_text.pack(side="left", fill="both", expand=True)
+        _sb.pack(side="right", fill="y")
+
+        # ── Send Inventory Audit Status controls ────────────────────────────
         controls = ttk.LabelFrame(self.status_tab, text="Send Inventory Audit Status", padding=10)
         controls.pack(fill="x", pady=(0, 5))
         ttk.Label(controls, text="Send by:").grid(row=0, column=0, sticky="w")
