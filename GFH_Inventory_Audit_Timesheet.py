@@ -131,6 +131,7 @@ if not getattr(sys, "frozen", False):
 import csv
 import datetime as dt
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -2624,6 +2625,451 @@ def show_startup_error(exc: BaseException) -> None:
 GFH_SQUARE_ICON_B64 = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "gfh_square_icon_b64.txt"), "r").read().strip() if not getattr(sys, "frozen", False) else open(os.path.join(getattr(sys, "_MEIPASS", "."), "assets", "gfh_square_icon_b64.txt"), "r").read().strip()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Portal Credential Store
+# ─────────────────────────────────────────────────────────────────────────────
+class PortalCredentialStore:
+    """Thread-safe credential storage with base64 obfuscation.
+
+    Saved to <APP_DIR>/portal_credentials.json with restricted permissions.
+    Passwords are base64-obfuscated (not encrypted, but not plain-text).
+    """
+    FILENAME = "portal_credentials.json"
+    _lock = threading.Lock()
+
+    def __init__(self, app_dir: Path):
+        self.path = Path(app_dir) / self.FILENAME
+
+    @staticmethod
+    def _obf(v: str) -> str:
+        return base64.b64encode(v.encode()).decode() if v else ""
+
+    @staticmethod
+    def _deobf(v: str) -> str:
+        if not v:
+            return ""
+        try:
+            return base64.b64decode(v.encode()).decode()
+        except Exception:
+            return v  # legacy plain-text tolerance
+
+    def load(self) -> dict:
+        with self._lock:
+            if not self.path.exists():
+                return {}
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                # Deobfuscate passwords
+                for section in ("brs", "timesheet"):
+                    if section in raw:
+                        raw[section]["password"] = self._deobf(raw[section].get("password", ""))
+                return raw
+            except Exception:
+                return {}
+
+    def save(self, data: dict) -> None:
+        with self._lock:
+            out = {k: dict(v) for k, v in data.items()}
+            for section in ("brs", "timesheet"):
+                if section in out:
+                    out[section]["password"] = self._obf(out[section].get("password", ""))
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(out, indent=2, ensure_ascii=False), encoding="utf-8")
+            try:
+                if os.name == "posix":
+                    os.chmod(self.path, 0o600)
+            except Exception:
+                pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# B2B Soft Scraper (wsreports.b2bsoft.com)
+# ─────────────────────────────────────────────────────────────────────────────
+class B2BSoftScraper:
+    """Selenium scraper for the B2B Soft inventory portal.
+
+    Login flow:
+        Step 1 → Enter Company ID (#companyId) → click #btnSubmit
+        Step 2 → Enter Account ID (#AccountId)
+        Step 3 → Enter Username (#Username) + Password (#Password) → click #btnClick
+
+    After login, navigates to Inventory Count Result Details report and
+    downloads the XLSX file.
+    """
+    PORTAL_URL = "https://wsreports.b2bsoft.com/#"
+    REPORT_SELECTOR = "[uniq='9-212318']"
+
+    def __init__(self, company_id: str, account_id: str,
+                 username: str, password: str,
+                 download_dir: Path, log_fn=None):
+        self.company_id = company_id
+        self.account_id = account_id
+        self.username = username
+        self.password = password
+        self.download_dir = Path(download_dir)
+        self.log = log_fn or (lambda m: None)
+        self.driver = None
+
+    def _make_driver(self):
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.edge.options import Options as EdgeOptions
+            from selenium.webdriver.edge.service import Service as EdgeService
+            opts = EdgeOptions()
+            prefs = {
+                "download.default_directory": str(self.download_dir),
+                "download.prompt_for_download": False,
+                "plugins.always_open_pdf_externally": True,
+            }
+            opts.add_experimental_option("prefs", prefs)
+            self.driver = webdriver.Edge(options=opts)
+        except Exception:
+            try:
+                from selenium import webdriver
+                from selenium.webdriver.chrome.options import Options as ChromeOptions
+                opts = ChromeOptions()
+                prefs = {
+                    "download.default_directory": str(self.download_dir),
+                    "download.prompt_for_download": False,
+                }
+                opts.add_experimental_option("prefs", prefs)
+                self.driver = webdriver.Chrome(options=opts)
+            except Exception as exc:
+                raise RuntimeError(f"Could not start Edge or Chrome WebDriver: {exc}")
+
+    def login(self) -> bool:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        if not all([self.company_id, self.account_id, self.username, self.password]):
+            raise RuntimeError("B2B credentials incomplete — fill Portal Credentials tab.")
+        if self.driver is None:
+            self._make_driver()
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.log(f"Opening {self.PORTAL_URL}")
+        self.driver.get(self.PORTAL_URL)
+        time.sleep(2)
+        wait = WebDriverWait(self.driver, 25)
+        # Step 1: Company ID
+        try:
+            f = wait.until(EC.presence_of_element_located((By.ID, "companyId")))
+            f.clear(); f.send_keys(self.company_id)
+            self.log(f"Company ID: {self.company_id}")
+            wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit"))).click()
+            time.sleep(2)
+        except Exception as e:
+            raise RuntimeError(f"B2B Step 1 (Company ID) failed: {e}")
+        # Step 2: Account ID
+        try:
+            f = wait.until(EC.presence_of_element_located((By.ID, "AccountId")))
+            f.clear(); f.send_keys(self.account_id)
+            self.log(f"Account ID: {self.account_id}")
+            time.sleep(1)
+        except Exception as e:
+            raise RuntimeError(f"B2B Step 2 (Account ID) failed: {e}")
+        # Step 3: Username + Password
+        try:
+            u = wait.until(EC.presence_of_element_located((By.ID, "Username")))
+            p = self.driver.find_element(By.ID, "Password")
+            u.clear(); u.send_keys(self.username)
+            p.clear(); p.send_keys(self.password)
+            self.log(f"Username: {self.username}")
+            wait.until(EC.element_to_be_clickable((By.ID, "btnClick"))).click()
+            time.sleep(3)
+        except Exception as e:
+            raise RuntimeError(f"B2B Step 3 (Username/Password) failed: {e}")
+        # Verify
+        deadline = time.time() + 35
+        while time.time() < deadline:
+            if self._is_authed():
+                self.log("✓ B2B login successful")
+                return True
+            time.sleep(1)
+        raise RuntimeError("B2B login timed out — check Company ID, Account ID, Username, Password.")
+
+    def _is_authed(self) -> bool:
+        from selenium.webdriver.common.by import By
+        try:
+            if self.driver.find_elements(By.ID, "companyId"):
+                return False
+            if self.driver.find_elements(By.ID, "Username"):
+                return False
+            return bool(self.driver.find_elements(By.CSS_SELECTOR,
+                "table, .x-panel, #reportGrid, .report, main, #root"))
+        except Exception:
+            return False
+
+    def navigate_to_report(self) -> bool:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        try:
+            w = WebDriverWait(self.driver, 15)
+            w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, self.REPORT_SELECTOR))).click()
+            time.sleep(2)
+            self.log("✓ Navigated to Inventory Count Result Details")
+            return True
+        except Exception:
+            self.log("Report tree item not found — using current view")
+            return False
+
+    def download_xlsx(self, timeout: int = 45) -> Optional[Path]:
+        """Try to trigger an XLSX download and return the file path."""
+        from selenium.webdriver.common.by import By
+        existing = set(self.download_dir.glob("*.xlsx"))
+        # Try visible export/download buttons
+        try:
+            for text in ["count sheet", "countsheet", "download", "export", "xlsx", "excel"]:
+                btns = self.driver.find_elements(By.XPATH,
+                    f"//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    f"'abcdefghijklmnopqrstuvwxyz'),'{text}')] | "
+                    f"//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    f"'abcdefghijklmnopqrstuvwxyz'),'{text}')]")
+                for btn in btns:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        self.log(f"Clicked export button: {text}")
+                        time.sleep(3)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        # Try JS widget export
+        try:
+            src = self.driver.page_source
+            m = re.search(r"window\['(Widget_\d+)'\]", src)
+            if m:
+                widget = m.group(1)
+                self.driver.execute_script(f"window['{widget}'].WidgetPages.ExportReport('Xlsx', 1)")
+                self.log("Triggered JS widget XLSX export")
+                time.sleep(5)
+        except Exception:
+            pass
+        # Wait for file
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            new_files = set(self.download_dir.glob("*.xlsx")) - existing
+            if new_files:
+                f = max(new_files, key=lambda p: p.stat().st_mtime)
+                self.log(f"✓ Downloaded: {f.name}")
+                return f
+            time.sleep(1)
+        self.log("No XLSX download detected within timeout")
+        return None
+
+    def quit(self):
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+        self.driver = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Timesheet Scraper (gfh-telecom-app.web.app/timesheet)
+# ─────────────────────────────────────────────────────────────────────────────
+class TimesheetScraper:
+    """Selenium scraper for the GFH Timesheet portal (Firebase auth)."""
+    PORTAL_URL = "https://gfh-telecom-app.web.app/timesheet"
+
+    def __init__(self, email: str, password: str,
+                 download_dir: Path, log_fn=None):
+        self.email = email
+        self.password = password
+        self.download_dir = Path(download_dir)
+        self.log = log_fn or (lambda m: None)
+        self.driver = None
+
+    def _make_driver(self):
+        try:
+            from selenium import webdriver
+            from selenium.webdriver.edge.options import Options as EdgeOptions
+            opts = EdgeOptions()
+            prefs = {
+                "download.default_directory": str(self.download_dir),
+                "download.prompt_for_download": False,
+            }
+            opts.add_experimental_option("prefs", prefs)
+            self.driver = webdriver.Edge(options=opts)
+        except Exception:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options as ChromeOptions
+            opts = ChromeOptions()
+            prefs = {
+                "download.default_directory": str(self.download_dir),
+                "download.prompt_for_download": False,
+            }
+            opts.add_experimental_option("prefs", prefs)
+            self.driver = webdriver.Chrome(options=opts)
+
+    def login(self) -> bool:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        if not (self.email and self.password):
+            raise RuntimeError("Timesheet credentials incomplete — fill Portal Credentials tab.")
+        if self.driver is None:
+            self._make_driver()
+        self.download_dir.mkdir(parents=True, exist_ok=True)
+        self.log(f"Opening {self.PORTAL_URL}")
+        self.driver.get(self.PORTAL_URL)
+        time.sleep(3)
+        wait = WebDriverWait(self.driver, 30)
+        try:
+            email_field = wait.until(EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "input[type='email'], input[name='email'], #email")))
+            email_field.clear()
+            email_field.send_keys(self.email)
+            self.log(f"Entered email: {self.email}")
+            pw_field = self.driver.find_element(
+                By.CSS_SELECTOR, "input[type='password'], input[name='password'], #password")
+            pw_field.clear()
+            pw_field.send_keys(self.password)
+            submit = self.driver.find_element(
+                By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], .login-btn, #loginBtn")
+            submit.click()
+            time.sleep(4)
+            self.log("✓ Timesheet login submitted")
+            return True
+        except Exception as e:
+            raise RuntimeError(f"Timesheet login failed: {e}")
+
+    def download_xlsx(self, timeout: int = 45) -> Optional[Path]:
+        """Try to trigger a timesheet XLSX download."""
+        from selenium.webdriver.common.by import By
+        existing = set(self.download_dir.glob("*.xlsx"))
+        try:
+            for text in ["export", "download", "xlsx", "excel"]:
+                btns = self.driver.find_elements(By.XPATH,
+                    f"//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    f"'abcdefghijklmnopqrstuvwxyz'),'{text}')] | "
+                    f"//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+                    f"'abcdefghijklmnopqrstuvwxyz'),'{text}')]")
+                for btn in btns:
+                    try:
+                        self.driver.execute_script("arguments[0].click();", btn)
+                        self.log(f"Clicked timesheet export: {text}")
+                        time.sleep(3)
+                        break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            new_files = set(self.download_dir.glob("*.xlsx")) - existing
+            if new_files:
+                f = max(new_files, key=lambda p: p.stat().st_mtime)
+                self.log(f"✓ Timesheet downloaded: {f.name}")
+                return f
+            time.sleep(1)
+        self.log("No timesheet XLSX downloaded within timeout")
+        return None
+
+    def quit(self):
+        try:
+            if self.driver:
+                self.driver.quit()
+        except Exception:
+            pass
+        self.driver = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit Scheduler
+# ─────────────────────────────────────────────────────────────────────────────
+class AuditScheduler:
+    """Per-district time-based audit scheduler.
+
+    After the configured start time, sends the starting WhatsApp message,
+    then every POLL_INTERVAL_MIN minutes: re-exports B2B + timesheet,
+    reloads variances, and checks district completion.
+
+    States: idle → running → held → running (resume) → stopped.
+    """
+    POLL_INTERVAL_MIN = 15
+
+    def __init__(self, app: "GFHApp"):
+        self.app = app
+        self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        self._hold_event = threading.Event()  # cleared = held, set = running
+        self._hold_event.set()
+        self._state = "idle"   # idle | running | held | stopped
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def start(self, district_times: dict) -> None:
+        """district_times: {district_name: 'HH:MM'} or '' to start immediately."""
+        if self._state == "running":
+            return
+        self._stop_event.clear()
+        self._hold_event.set()
+        self._state = "running"
+        self._thread = threading.Thread(
+            target=self._run_loop, args=(district_times,), daemon=True, name="AuditScheduler")
+        self._thread.start()
+        self.app._log_scheduler(f"Scheduler started for {len(district_times)} districts.")
+
+    def hold(self) -> None:
+        if self._state == "running":
+            self._hold_event.clear()
+            self._state = "held"
+            self.app._log_scheduler("Scheduler paused (Hold).")
+
+    def resume(self) -> None:
+        if self._state == "held":
+            self._hold_event.set()
+            self._state = "running"
+            self.app._log_scheduler("Scheduler resumed.")
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._hold_event.set()  # unblock hold
+        self._state = "stopped"
+        self.app._log_scheduler("Scheduler stopped.")
+
+    def _run_loop(self, district_times: dict) -> None:
+        import datetime as _dt
+        # Track which districts have fired their start
+        fired: set = set()
+        # Track last export time
+        last_export: Optional[float] = None
+        POLL_SEC = self.POLL_INTERVAL_MIN * 60
+
+        while not self._stop_event.is_set():
+            self._hold_event.wait()          # blocks while held
+            if self._stop_event.is_set():
+                break
+            now = _dt.datetime.now()
+            # Check each district start time
+            for district, start_str in list(district_times.items()):
+                if district in fired:
+                    continue
+                if start_str:
+                    try:
+                        h, m = map(int, start_str.split(":"))
+                        target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                        if now < target:
+                            continue
+                    except Exception:
+                        pass
+                # Fire start for this district
+                self.app.after(0, lambda d=district: self.app._scheduler_start_district(d))
+                fired.add(district)
+            # Periodic export every POLL_INTERVAL_MIN
+            if last_export is None or (time.time() - last_export) >= POLL_SEC:
+                if fired:  # only after at least one district started
+                    self.app.after(0, self.app._scheduler_run_export_cycle)
+                    last_export = time.time()
+            time.sleep(10)
+        self._state = "stopped"
+
+
 class GFHApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -2722,6 +3168,22 @@ class GFHApp(tk.Tk):
         self.inventory_path = tk.StringVar(value="")
         self.time_sheet_path = tk.StringVar(value="")
         self.status_text = tk.StringVar(value="Select the Inventory_Count_Result_Details file, then click Load Variances. No data loaded yet.")
+
+        # ── Portal Credentials ──────────────────────────────────────────────
+        self._cred_store = PortalCredentialStore(APP_DIR)
+        self.brs_company_id_var = tk.StringVar(value="9909129")
+        self.brs_account_id_var = tk.StringVar(value="")
+        self.brs_username_var = tk.StringVar(value="")
+        self.brs_password_var = tk.StringVar(value="")
+        self.ts_email_var = tk.StringVar(value="")
+        self.ts_password_var = tk.StringVar(value="")
+        self._load_saved_credentials()
+
+        # ── Scheduler state ─────────────────────────────────────────────────
+        self._scheduler = AuditScheduler(self)
+        self._sched_time_vars: Dict[str, tk.StringVar] = {}   # district → HH:MM var
+        self._sched_log_var = tk.StringVar(value="Scheduler idle.")
+        self._auto_import_done = False
         self.summary_text = tk.StringVar(value="No data loaded")
         self.include_cleared = tk.BooleanVar(value=False)
         self.send_only_unsent = tk.BooleanVar(value=SEND_ONLY_UNSENT_BY_DEFAULT)
@@ -3044,12 +3506,16 @@ class GFHApp(tk.Tk):
         self.rep_tab = ttk.Frame(self.notebook, padding=10)
         self.dm_tab = ttk.Frame(self.notebook, padding=10)
         self.exclusion_tab = ttk.Frame(self.notebook, padding=10)
+        self.credentials_tab = ttk.Frame(self.notebook, padding=10)
+        self.scheduler_tab = ttk.Frame(self.notebook, padding=10)
         self.notebook.add(self.status_tab, text="Inventory Audit Status")
         self.notebook.add(self.audit_tab, text="Variance Audit")
         self.notebook.add(self.store_tab, text="Store List")
         self.notebook.add(self.rep_tab, text="Employees")
         self.notebook.add(self.dm_tab, text="District DMs")
         self.notebook.add(self.exclusion_tab, text="Excluded Devices")
+        self.notebook.add(self.credentials_tab, text="Portal Credentials")
+        self.notebook.add(self.scheduler_tab, text="Audit Scheduler")
 
         self._build_status_tab()
         self._build_audit_tab()
@@ -3057,6 +3523,8 @@ class GFHApp(tk.Tk):
         self._build_rep_tab()
         self._build_dm_tab()
         self._build_exclusion_tab()
+        self._build_credentials_tab()
+        self._build_scheduler_tab()
         self.refresh_store_accounts_table()
         self.refresh_sales_reps_table()
         self.refresh_district_managers_table()
@@ -3069,6 +3537,374 @@ class GFHApp(tk.Tk):
         # Theme toggle is now built directly in the header grid above (_theme_btn).
         # The old theme_manager.create_theme_toggle_button call has been removed
         # to avoid a second button appearing outside the header.
+
+    # ── Portal Credentials Tab ──────────────────────────────────────────────
+    def _build_credentials_tab(self) -> None:
+        """Build the Portal Credentials tab UI."""
+        tab = self.credentials_tab
+        # BRS Section
+        brs_box = ttk.LabelFrame(tab, text="B2B Soft Portal (wsreports.b2bsoft.com)", padding=12)
+        brs_box.pack(fill="x", pady=(0, 10))
+        fields_brs = [
+            ("Company ID",  self.brs_company_id_var, False),
+            ("Account ID",  self.brs_account_id_var, False),
+            ("Username",    self.brs_username_var,   False),
+            ("Password",    self.brs_password_var,   True),
+        ]
+        for row_i, (label, var, is_pw) in enumerate(fields_brs):
+            ttk.Label(brs_box, text=label, width=14, anchor="e").grid(
+                row=row_i, column=0, sticky="e", padx=(0, 8), pady=4)
+            show_char = "●" if is_pw else ""
+            ttk.Entry(brs_box, textvariable=var, width=36,
+                      show=show_char).grid(row=row_i, column=1, sticky="w", pady=4)
+
+        # Timesheet Section
+        ts_box = ttk.LabelFrame(tab, text="Timesheet Portal (gfh-telecom-app.web.app)", padding=12)
+        ts_box.pack(fill="x", pady=(0, 10))
+        fields_ts = [
+            ("Email",    self.ts_email_var,    False),
+            ("Password", self.ts_password_var, True),
+        ]
+        for row_i, (label, var, is_pw) in enumerate(fields_ts):
+            ttk.Label(ts_box, text=label, width=14, anchor="e").grid(
+                row=row_i, column=0, sticky="e", padx=(0, 8), pady=4)
+            show_char = "●" if is_pw else ""
+            ttk.Entry(ts_box, textvariable=var, width=36,
+                      show=show_char).grid(row=row_i, column=1, sticky="w", pady=4)
+
+        # Save / Test buttons
+        btn_row = ttk.Frame(tab)
+        btn_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(btn_row, text="💾  Save Credentials",
+                   command=self._save_credentials).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="🔌  Test B2B Login",
+                   command=self._test_brs_login).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="🔌  Test Timesheet Login",
+                   command=self._test_ts_login).pack(side="left")
+
+    def _save_credentials(self) -> None:
+        data = {
+            "brs": {
+                "company_id": self.brs_company_id_var.get().strip(),
+                "account_id": self.brs_account_id_var.get().strip(),
+                "username":   self.brs_username_var.get().strip(),
+                "password":   self.brs_password_var.get(),
+            },
+            "timesheet": {
+                "email":    self.ts_email_var.get().strip(),
+                "password": self.ts_password_var.get(),
+            },
+        }
+        try:
+            self._cred_store.save(data)
+            messagebox.showinfo("Saved", "Portal credentials saved.", parent=self)
+        except Exception as exc:
+            messagebox.showerror("Save Error", str(exc), parent=self)
+
+    def _load_saved_credentials(self) -> None:
+        try:
+            data = self._cred_store.load()
+            brs = data.get("brs", {})
+            self.brs_company_id_var.set(brs.get("company_id", "9909129") or "9909129")
+            self.brs_account_id_var.set(brs.get("account_id", "") or "")
+            self.brs_username_var.set(brs.get("username", "") or "")
+            self.brs_password_var.set(brs.get("password", "") or "")
+            ts = data.get("timesheet", {})
+            self.ts_email_var.set(ts.get("email", "") or "")
+            self.ts_password_var.set(ts.get("password", "") or "")
+        except Exception:
+            pass
+
+    def _test_brs_login(self) -> None:
+        self._save_credentials()
+        scraper = B2BSoftScraper(
+            company_id=self.brs_company_id_var.get().strip(),
+            account_id=self.brs_account_id_var.get().strip(),
+            username=self.brs_username_var.get().strip(),
+            password=self.brs_password_var.get(),
+            download_dir=EXPORT_DIR,
+            log_fn=lambda m: self.set_status(f"[B2B] {m}"),
+        )
+        def _run():
+            try:
+                scraper.login()
+                self.after(0, lambda: messagebox.showinfo("B2B Login", "✓ Login successful!", parent=self))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("B2B Login Failed", str(exc), parent=self))
+            finally:
+                scraper.quit()
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _test_ts_login(self) -> None:
+        self._save_credentials()
+        scraper = TimesheetScraper(
+            email=self.ts_email_var.get().strip(),
+            password=self.ts_password_var.get(),
+            download_dir=EXPORT_DIR,
+            log_fn=lambda m: self.set_status(f"[TS] {m}"),
+        )
+        def _run():
+            try:
+                scraper.login()
+                self.after(0, lambda: messagebox.showinfo("Timesheet Login", "✓ Login successful!", parent=self))
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Timesheet Login Failed", str(exc), parent=self))
+            finally:
+                scraper.quit()
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ── Audit Scheduler Tab ─────────────────────────────────────────────────
+    def _build_scheduler_tab(self) -> None:
+        """Build the Audit Scheduler tab UI."""
+        tab = self.scheduler_tab
+
+        # Info banner
+        info = ttk.Label(tab, text=(
+            "Set a start time per district (HH:MM, 24h). Leave blank to start immediately when Start is clicked.\n"
+            "After start time: sends the Starting WhatsApp message to the district group.\n"
+            "Every 15 minutes: auto-exports B2B count sheet + Timesheet, reloads variances, sends inventory status.\n"
+            "The scheduler keeps running until all districts complete or you click Stop."
+        ), wraplength=950, justify="left")
+        info.pack(anchor="w", pady=(0, 8))
+
+        # Auto-import button
+        import_row = ttk.Frame(tab)
+        import_row.pack(fill="x", pady=(0, 8))
+        ttk.Button(import_row, text="⟳  Auto-Import Districts & Stores from Inventory",
+                   command=self._auto_import_stores_from_inventory).pack(side="left", padx=(0, 8))
+        ttk.Label(import_row, text="(imports store list from the loaded inventory count file)").pack(side="left")
+
+        # District time input grid
+        self._sched_frame = ttk.LabelFrame(tab, text="District Start Times", padding=10)
+        self._sched_frame.pack(fill="x", pady=(0, 10))
+        self._build_scheduler_district_rows()
+
+        # Control buttons
+        ctrl_row = ttk.Frame(tab)
+        ctrl_row.pack(fill="x", pady=(4, 8))
+        self._sched_start_btn = ttk.Button(ctrl_row, text="▶  Start",  command=self._sched_start)
+        self._sched_stop_btn  = ttk.Button(ctrl_row, text="■  Stop",   command=self._sched_stop)
+        self._sched_hold_btn  = ttk.Button(ctrl_row, text="⏸  Hold",   command=self._sched_hold)
+        self._sched_resume_btn= ttk.Button(ctrl_row, text="⏵  Resume", command=self._sched_resume)
+        for btn in (self._sched_start_btn, self._sched_stop_btn,
+                    self._sched_hold_btn, self._sched_resume_btn):
+            btn.pack(side="left", padx=(0, 8))
+
+        # Status log
+        log_frame = ttk.LabelFrame(tab, text="Scheduler Log", padding=8)
+        log_frame.pack(fill="both", expand=True, pady=(0, 0))
+        self._sched_log_text = tk.Text(log_frame, height=10, state="disabled",
+                                       wrap="word", relief="flat")
+        _sb = ttk.Scrollbar(log_frame, orient="vertical", command=self._sched_log_text.yview)
+        self._sched_log_text.configure(yscrollcommand=_sb.set)
+        self._sched_log_text.pack(side="left", fill="both", expand=True)
+        _sb.pack(side="right", fill="y")
+
+    def _build_scheduler_district_rows(self) -> None:
+        """Build one row per known district with an HH:MM time-entry field."""
+        for w in self._sched_frame.winfo_children():
+            w.destroy()
+        self._sched_time_vars.clear()
+        districts = self._known_districts_for_scheduler()
+        if not districts:
+            ttk.Label(self._sched_frame,
+                      text="No districts found. Load an inventory file or add stores in the Store List tab."
+                      ).grid(row=0, column=0, sticky="w")
+            return
+        for col_base in range(0, min(len(districts), 6), 2):
+            self._sched_frame.columnconfigure(col_base + 1, weight=1)
+        for idx, dist in enumerate(districts):
+            col = (idx % 3) * 3
+            row = idx // 3
+            var = tk.StringVar(value=self._sched_time_vars.get(dist, tk.StringVar()).get())
+            self._sched_time_vars[dist] = var
+            ttk.Label(self._sched_frame, text=dist, width=18, anchor="e").grid(
+                row=row, column=col, sticky="e", padx=(6, 4), pady=4)
+            ttk.Entry(self._sched_frame, textvariable=var, width=8).grid(
+                row=row, column=col + 1, sticky="w", padx=(0, 16), pady=4)
+            ttk.Label(self._sched_frame, text="HH:MM", foreground="#8090b0").grid(
+                row=row, column=col + 2, sticky="w", padx=(0, 12), pady=4)
+
+    def _known_districts_for_scheduler(self) -> List[str]:
+        """Return distinct districts from the DB store list."""
+        try:
+            return sorted(set(self.db.all_known_districts()))
+        except Exception:
+            return []
+
+    def _sched_start(self) -> None:
+        times = {d: v.get().strip() for d, v in self._sched_time_vars.items()}
+        if not times:
+            messagebox.showwarning("No Districts", "No districts to schedule. Import inventory first.", parent=self)
+            return
+        self._scheduler.start(times)
+        self._log_scheduler("▶ Started.")
+
+    def _sched_stop(self) -> None:
+        self._scheduler.stop()
+
+    def _sched_hold(self) -> None:
+        self._scheduler.hold()
+
+    def _sched_resume(self) -> None:
+        self._scheduler.resume()
+
+    def _log_scheduler(self, msg: str) -> None:
+        """Append a message to the scheduler log text widget."""
+        import datetime as _dt
+        timestamp = _dt.datetime.now().strftime("%H:%M:%S")
+        full_msg = f"[{timestamp}] {msg}\n"
+        try:
+            self._sched_log_text.configure(state="normal")
+            self._sched_log_text.insert("end", full_msg)
+            self._sched_log_text.see("end")
+            self._sched_log_text.configure(state="disabled")
+        except Exception:
+            pass
+
+    # ── Scheduler callbacks (run on main thread via after()) ────────────────
+    def _scheduler_start_district(self, district: str) -> None:
+        """Send the starting WhatsApp message for a district."""
+        self._log_scheduler(f"Sending starting message → {district}")
+        try:
+            self.send_starting_message()
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Starting message error: {exc}")
+
+    def _scheduler_run_export_cycle(self) -> None:
+        """Export B2B + Timesheet files, reload variances, send status."""
+        self._log_scheduler("⟳ Running export cycle…")
+        def _run():
+            try:
+                # B2B export
+                brs = B2BSoftScraper(
+                    company_id=self.brs_company_id_var.get().strip(),
+                    account_id=self.brs_account_id_var.get().strip(),
+                    username=self.brs_username_var.get().strip(),
+                    password=self.brs_password_var.get(),
+                    download_dir=EXPORT_DIR,
+                    log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[B2B] {m}")),
+                )
+                inv_file = None
+                try:
+                    brs.login()
+                    brs.navigate_to_report()
+                    inv_file = brs.download_xlsx()
+                except Exception as exc:
+                    self.after(0, lambda: self._log_scheduler(f"⚠ B2B export error: {exc}"))
+                finally:
+                    brs.quit()
+
+                # Timesheet export
+                ts = TimesheetScraper(
+                    email=self.ts_email_var.get().strip(),
+                    password=self.ts_password_var.get(),
+                    download_dir=EXPORT_DIR,
+                    log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[TS] {m}")),
+                )
+                ts_file = None
+                try:
+                    ts.login()
+                    ts_file = ts.download_xlsx()
+                except Exception as exc:
+                    self.after(0, lambda: self._log_scheduler(f"⚠ Timesheet export error: {exc}"))
+                finally:
+                    ts.quit()
+
+                # Reload variances and send status
+                def _reload_and_send():
+                    try:
+                        if inv_file and inv_file.exists():
+                            self.inventory_path.set(str(inv_file))
+                            self._log_scheduler(f"Loaded B2B file: {inv_file.name}")
+                        if ts_file and ts_file.exists():
+                            self.time_sheet_path.set(str(ts_file))
+                            self._log_scheduler(f"Loaded timesheet: {ts_file.name}")
+                        if inv_file or ts_file:
+                            self.load_variances()
+                            self._auto_import_stores_from_inventory()
+                    except Exception as exc:
+                        self._log_scheduler(f"⚠ Reload error: {exc}")
+                self.after(0, _reload_and_send)
+            except Exception as exc:
+                self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
+        threading.Thread(target=_run, daemon=True, name="ExportCycle").start()
+
+    # ── Auto-import stores from inventory count ──────────────────────────────
+    def _auto_import_stores_from_inventory(self) -> None:
+        """Scan the loaded inventory XLSX and auto-populate the Store List from it."""
+        inv_path_str = self.inventory_path.get().strip()
+        if not inv_path_str:
+            self.set_status("Auto-import: no inventory file loaded yet.")
+            return
+        inv_path = Path(inv_path_str)
+        if not inv_path.exists():
+            self.set_status(f"Auto-import: file not found — {inv_path.name}")
+            return
+        try:
+            wb = openpyxl.load_workbook(inv_path, read_only=True, data_only=True)
+            ws = wb.active
+            headers = []
+            store_col = district_col = None
+            for row in ws.iter_rows(max_row=3, values_only=True):
+                if any(str(c or "").strip() for c in row):
+                    headers = [str(c or "").strip().lower() for c in row]
+                    break
+            for i, h in enumerate(headers):
+                if h == "store":
+                    store_col = i
+                if h in ("district", "region", "market"):
+                    district_col = i
+
+            if store_col is None:
+                self.set_status("Auto-import: 'Store' column not found in inventory file.")
+                return
+
+            # Collect store-district pairs
+            DISTRICT_MAP = {
+                "az": "Arizona", "co": "Colorado", "la": "Louisiana",
+                "tn": "Tennessee", "tx": "Texas",
+            }
+            AZ_VARIANTS = {"arizona - d1", "arizona - d2", "arizona d1", "arizona d2",
+                           "arizona", "az"}
+
+            seen: set = set()
+            count = 0
+            for row in ws.iter_rows(min_row=2, values_only=True):
+                store = str(row[store_col] if row[store_col] is not None else "").strip()
+                if not store:
+                    continue
+                district = ""
+                if district_col is not None:
+                    district = str(row[district_col] if row[district_col] is not None else "").strip()
+                # Normalize district
+                d_lower = district.lower()
+                if d_lower in AZ_VARIANTS:
+                    district = "Arizona"
+                else:
+                    for abbr, full in DISTRICT_MAP.items():
+                        if d_lower == abbr or d_lower == full.lower():
+                            district = full
+                            break
+                key = (district.lower(), store.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    self.db.save_store_account(
+                        district=district, store=store,
+                        account_id="", username="", password="")
+                    count += 1
+                except Exception:
+                    pass
+
+            wb.close()
+            self.refresh_store_accounts_table()
+            self._build_scheduler_district_rows()
+            self.set_status(f"Auto-import: added/updated {count} store(s) from inventory file.")
+            self._log_scheduler(f"Auto-imported {count} stores from {inv_path.name}.")
+        except Exception as exc:
+            self.set_status(f"Auto-import error: {exc}")
 
     def _toggle_theme(self) -> None:
         """Toggle between dark and light theme."""
