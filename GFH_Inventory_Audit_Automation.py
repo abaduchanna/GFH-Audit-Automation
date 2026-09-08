@@ -3112,7 +3112,7 @@ _wa_fallback_opened: bool = False  # prevent webbrowser.open firing multiple tim
 # Dedicated Edge profile for GFH automation (same pattern as VidaPay transfer bot).
 # Edge is launched with --remote-debugging-port=9227 against this profile so
 # WhatsApp, B2B, and GFH app sessions persist across restarts.
-GFH_AUTOMATION_PROFILE_DIR = str(PACKAGE_DIR / "GFH_Edge_Profile")
+GFH_AUTOMATION_PROFILE_DIR = r"C:\GFH_Edge_Automation_Profile"
 
 
 def _get_edge_exe() -> Optional[str]:
