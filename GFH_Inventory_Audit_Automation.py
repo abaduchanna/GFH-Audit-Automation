@@ -2670,6 +2670,7 @@ class WhatsAppSender:
 
     def _send_text_web(self, group_name: str, text_message: str) -> None:
         """Send text via WhatsApp Web — opens in user's Edge profile (port 9227), reuses existing tab."""
+        global _wa_fallback_opened
         message = safe_text(text_message)
         if not message:
             return
@@ -2677,8 +2678,10 @@ class WhatsAppSender:
             driver = _edge_debug_driver()
             _find_or_open_tab(driver, _WA_URL)
         except Exception:
-            import webbrowser
-            webbrowser.open(_WA_URL)
+            if not _wa_fallback_opened:
+                import webbrowser
+                webbrowser.open(_WA_URL)
+                _wa_fallback_opened = True
         self.log(f"WhatsApp Web: {group_name!r} | Message: {message!r}")
         self.log("Tip: find the group in WhatsApp Web (Ctrl+F) and paste the message.")
 
@@ -3127,6 +3130,7 @@ EDGE_DEBUG_PORT = 9227
 _WA_URL = "https://web.whatsapp.com"
 _B2B_URL = "https://wsreports.b2bsoft.com/#"
 _GFH_APP_URL = "https://gfh-telecom-app.web.app/timesheet"
+_wa_fallback_opened: bool = False  # prevent webbrowser.open firing multiple times when Edge not running
 
 
 def _edge_debug_driver(port: int = EDGE_DEBUG_PORT):
@@ -3595,7 +3599,7 @@ class AuditScheduler:
         import datetime as _dt
         # fired[district] = {"start_ts": float, "export_done": bool, "reminders_sent": int, "final_sent": bool}
         fired: dict = {}
-        last_reextract: Optional[float] = None
+        last_reextract: float = time.time()  # init to now so first re-extract waits full RE_EXTRACT_SEC
         INITIAL_EXPORT_SEC = 15 * 60   # 15 min after district starts
         RE_EXTRACT_SEC = 30 * 60       # re-extract B2B + GFH every 30 min
         REMINDER_DELAYS = [30 * 60, 60 * 60, 90 * 60]  # 30, 60, 90 min after start
@@ -3656,7 +3660,7 @@ class AuditScheduler:
                     self.app.after(0, lambda d=district: self.app._auto_send_final_result(d))
 
             # Global re-extract B2B + GFH every 30 min (only after at least one district started)
-            if fired and (last_reextract is None or (now_ts - last_reextract) >= RE_EXTRACT_SEC):
+            if fired and (now_ts - last_reextract) >= RE_EXTRACT_SEC:
                 self.app.after(0, self.app._scheduler_run_export_cycle)
                 last_reextract = now_ts
 
@@ -4432,18 +4436,11 @@ class GFHApp(tk.Tk):
 
     # ── Scheduler callbacks (run on main thread via after()) ────────────────
     def _scheduler_start_district(self, district: str) -> None:
-        """Kick off a district audit: status image → starting message → actions panel screenshot."""
+        """Kick off a district audit: send starting message only. Status image + screenshot sent after export."""
         self._log_scheduler(f"▶ Starting district: {district}")
         def _run():
             try:
-                # 1. Send Inventory Audit Status image for this district
-                self.after(0, lambda: self._auto_send_status_image(district))
-                time.sleep(5)
-                # 2. Send starting message
                 self.after(0, lambda: self._auto_send_starting_message(district))
-                time.sleep(5)
-                # 3. Capture and send actions panel screenshot
-                self.after(0, lambda: self._send_actions_panel_screenshot(district))
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ District start error ({district}): {exc}"))
         threading.Thread(target=_run, daemon=True, name=f"StartDistrict-{district}").start()
@@ -4643,6 +4640,15 @@ class GFHApp(tk.Tk):
         import datetime as _dt
         try:
             import pytesseract
+            import os as _os
+            _tess_candidates = [
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            ]
+            for _c in _tess_candidates:
+                if _os.path.isfile(_c):
+                    pytesseract.pytesseract.tesseract_cmd = _c
+                    break
         except ImportError:
             self.after(0, lambda: self._log_scheduler("⚠ pytesseract not installed — OCR monitor disabled."))
             self._wa_ocr_running = False
