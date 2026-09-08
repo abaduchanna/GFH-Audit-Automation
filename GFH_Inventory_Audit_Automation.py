@@ -193,32 +193,9 @@ else:
 PORTABLE_APP_DIR = PACKAGE_DIR / "GFH_Inventory_Audit_Data"
 LEGACY_APP_DIR = Path.home() / "GFH_Inventory_Variance_GUI"
 
-def _is_onedrive_path(p: Path) -> bool:
-    """Return True when path is inside a OneDrive-synced folder."""
-    import os
-    p_str = str(p).lower()
-    markers = ["onedrive", "onedrive - "]
-    if any(m in p_str for m in markers):
-        return True
-    for env_var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
-        od = os.environ.get(env_var, "")
-        if od and str(p).lower().startswith(od.lower()):
-            return True
-    return False
-
 def _choose_app_dir() -> Path:
-    """
-    Prefer the portable folder next to the script so all laptops on a shared
-    network/USB location use the same database.  If the script lives inside a
-    OneDrive-synced folder, fall back to %LOCALAPPDATA% to prevent continuous
-    OneDrive sync activity from the DB polling loop.
-    """
-    import os
-    if _is_onedrive_path(PORTABLE_APP_DIR):
-        local_app = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        candidate = local_app / "GFH_Inventory_Audit_Data"
-    else:
-        candidate = PORTABLE_APP_DIR
+    """Always place data folder next to the EXE (or script), regardless of location."""
+    candidate = PORTABLE_APP_DIR
     try:
         candidate.mkdir(parents=True, exist_ok=True)
         test_file = candidate / ".write_test"
