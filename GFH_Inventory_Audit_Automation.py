@@ -3109,6 +3109,61 @@ _B2B_URL = "https://wsreports.b2bsoft.com/#"
 _GFH_APP_URL = "https://gfh-telecom-app.web.app/timesheet"
 _wa_fallback_opened: bool = False  # prevent webbrowser.open firing multiple times when Edge not running
 
+# Dedicated Edge profile for GFH automation (same pattern as VidaPay transfer bot).
+# Edge is launched with --remote-debugging-port=9227 against this profile so
+# WhatsApp, B2B, and GFH app sessions persist across restarts.
+GFH_AUTOMATION_PROFILE_DIR = str(PACKAGE_DIR / "GFH_Edge_Profile")
+
+
+def _get_edge_exe() -> Optional[str]:
+    import shutil as _shutil
+    for candidate in (
+        _shutil.which("msedge"),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ):
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _is_edge_port_open(port: int = EDGE_DEBUG_PORT, timeout: float = 1.0) -> bool:
+    import socket as _socket
+    try:
+        with _socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _ensure_edge_open(port: int = EDGE_DEBUG_PORT, log=None) -> bool:
+    """Launch Edge at debug port using GFH automation profile if not already running."""
+    if _is_edge_port_open(port):
+        return True
+    edge_exe = _get_edge_exe()
+    if not edge_exe:
+        if log:
+            log("⚠ Microsoft Edge not found — install Edge and retry.")
+        return False
+    import subprocess as _sp
+    os.makedirs(GFH_AUTOMATION_PROFILE_DIR, exist_ok=True)
+    _sp.Popen([
+        edge_exe,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={GFH_AUTOMATION_PROFILE_DIR}",
+        "--profile-directory=Default",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "about:blank",
+    ])
+    for _ in range(20):  # wait up to 10 s
+        time.sleep(0.5)
+        if _is_edge_port_open(port):
+            return True
+    if log:
+        log("⚠ Edge launched but port 9227 not ready — wait and retry.")
+    return False
+
 
 def _edge_debug_driver(port: int = EDGE_DEBUG_PORT):
     """Return a Selenium driver attached to the already-running Edge profile at port."""
@@ -4368,10 +4423,29 @@ class GFHApp(tk.Tk):
             except Exception:
                 dur_h = 12.0
             stop_time = now + _dt.timedelta(hours=dur_h)
+        # Event districts wait on before sending starting messages.
+        # Set by _scheduler_run_export_cycle after first export finishes.
+        self._initial_export_done = threading.Event()
+
         self._scheduler.start(adjusted_times, stop_time=stop_time)
         self._log_scheduler(f"▶ Started. Stops at {stop_time.strftime('%H:%M')}.")
         # Start WhatsApp notification OCR monitor for auto-IMEI clearing
         self._start_whatsapp_ocr_monitor()
+
+        # Open Edge at port 9227 (launch if not running), open monitoring tabs,
+        # then run initial export — districts wait for this before sending messages.
+        def _startup_sequence():
+            _log = lambda m: self.after(0, lambda: self._log_scheduler(m))
+            ready = _ensure_edge_open(log=_log)
+            if ready:
+                _log("✓ Edge ready at port 9227.")
+                open_monitoring_tabs()
+            else:
+                _log("⚠ Could not open Edge — starting messages will send without export.")
+                getattr(self, "_initial_export_done", None) and self._initial_export_done.set()
+                return
+            self._scheduler_run_export_cycle()
+        threading.Thread(target=_startup_sequence, daemon=True, name="SchedulerStartup").start()
 
     def _sched_save_times(self) -> None:
         import json as _json
@@ -4413,10 +4487,14 @@ class GFHApp(tk.Tk):
 
     # ── Scheduler callbacks (run on main thread via after()) ────────────────
     def _scheduler_start_district(self, district: str) -> None:
-        """Kick off a district audit: send starting message only. Status image + screenshot sent after export."""
+        """Kick off a district audit: wait for initial export, then send starting message."""
         self._log_scheduler(f"▶ Starting district: {district}")
         def _run():
             try:
+                # Wait until the initial export cycle finishes (Edge open + files downloaded).
+                ev = getattr(self, "_initial_export_done", None)
+                if ev is not None:
+                    ev.wait(timeout=600)  # max 10 min
                 self.after(0, lambda: self._auto_send_starting_message(district))
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ District start error ({district}): {exc}"))
@@ -4482,6 +4560,11 @@ class GFHApp(tk.Tk):
                 self.after(0, _reload_and_send)
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
+            finally:
+                # Unblock district starting messages after first export attempt (pass or fail).
+                ev = getattr(self, "_initial_export_done", None)
+                if ev is not None and not ev.is_set():
+                    ev.set()
         threading.Thread(target=_run, daemon=True, name="ExportCycle").start()
 
     # ── Scheduler automation helpers (no-dialog versions) ───────────────────
