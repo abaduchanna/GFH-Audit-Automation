@@ -4423,11 +4423,10 @@ class GFHApp(tk.Tk):
             except Exception:
                 dur_h = 12.0
             stop_time = now + _dt.timedelta(hours=dur_h)
-        # Event districts wait on before sending starting messages.
-        # Set by _scheduler_run_export_cycle after first export finishes.
-        self._initial_export_done = threading.Event()
         # Tracks districts whose scheduled start has fired this session.
         self._scheduler_fired_districts: set = set()
+        # Tracks districts whose starting message has not yet been sent.
+        self._scheduler_pending_messages: set = set()
 
         self._scheduler.start(adjusted_times, stop_time=stop_time)
         self._log_scheduler(f"▶ Started. Stops at {stop_time.strftime('%H:%M')}.")
@@ -4435,7 +4434,8 @@ class GFHApp(tk.Tk):
         self._start_whatsapp_ocr_monitor()
 
         # Open Edge at port 9227 (launch if not running), open monitoring tabs,
-        # then run initial export — districts wait for this before sending messages.
+        # then run initial export. Starting messages send INSIDE the export
+        # cycle completion callback — never before download finishes.
         def _startup_sequence():
             _log = lambda m: self.after(0, lambda: self._log_scheduler(m))
             ready = _ensure_edge_open(log=_log)
@@ -4443,9 +4443,7 @@ class GFHApp(tk.Tk):
                 _log("✓ Edge ready at port 9227.")
                 open_monitoring_tabs()
             else:
-                _log("⚠ Could not open Edge — starting messages will send without export.")
-                getattr(self, "_initial_export_done", None) and self._initial_export_done.set()
-                return
+                _log("⚠ Could not open Edge at port 9227.")
             self._scheduler_run_export_cycle()
         threading.Thread(target=_startup_sequence, daemon=True, name="SchedulerStartup").start()
 
@@ -4489,21 +4487,11 @@ class GFHApp(tk.Tk):
 
     # ── Scheduler callbacks (run on main thread via after()) ────────────────
     def _scheduler_start_district(self, district: str) -> None:
-        """Kick off a district audit: wait for initial export, then send starting message."""
+        """Mark district as fired. Starting message sends after export cycle completes."""
         self._log_scheduler(f"▶ Starting district: {district}")
-        def _run():
-            try:
-                # Wait until the initial export cycle finishes (Edge open + files downloaded).
-                ev = getattr(self, "_initial_export_done", None)
-                if ev is not None:
-                    ev.wait(timeout=600)  # max 10 min
-                fired_set = getattr(self, "_scheduler_fired_districts", None)
-                if fired_set is not None:
-                    fired_set.add(district)
-                self.after(0, lambda: self._auto_send_starting_message(district))
-            except Exception as exc:
-                self.after(0, lambda: self._log_scheduler(f"⚠ District start error ({district}): {exc}"))
-        threading.Thread(target=_run, daemon=True, name=f"StartDistrict-{district}").start()
+        fired_set = getattr(self, "_scheduler_fired_districts", None)
+        if fired_set is not None:
+            fired_set.add(district)
 
     def _scheduler_run_export_cycle(self, district: str = None) -> None:
         """Export B2B + Timesheet files, reload variances, optionally send variance image."""
@@ -4563,11 +4551,21 @@ class GFHApp(tk.Tk):
                         if both_ready:
                             self.load_variances()
                             self._auto_import_stores_from_inventory()
-                            # Send status image for every district that has fired this session.
-                            for d in list(getattr(self, "_scheduler_fired_districts", set())):
+
+                        # Send starting message + status image for every fired district.
+                        # This is the ONLY place starting messages send — after export attempt.
+                        fired = list(getattr(self, "_scheduler_fired_districts", set()))
+                        pending = getattr(self, "_scheduler_pending_messages", None)
+                        if pending is None:
+                            self._scheduler_pending_messages = set(fired)
+                            pending = self._scheduler_pending_messages
+                        unsent = [d for d in fired if d in pending]
+                        for d in unsent:
+                            self._auto_send_starting_message(d)
+                            if both_ready:
                                 self._auto_send_status_image(d)
-                        elif inv_file or ts_file:
-                            self._log_scheduler("⚠ Only one file downloaded — skipping load_variances until both ready.")
+                            pending.discard(d)
+
                         if _district_for_send:
                             self._auto_send_variance_image(_district_for_send)
                     except Exception as exc:
@@ -4575,11 +4573,6 @@ class GFHApp(tk.Tk):
                 self.after(0, _reload_and_send)
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
-            finally:
-                # Unblock district starting messages after first export attempt (pass or fail).
-                ev = getattr(self, "_initial_export_done", None)
-                if ev is not None and not ev.is_set():
-                    ev.set()
         threading.Thread(target=_run, daemon=True, name="ExportCycle").start()
 
     # ── Scheduler automation helpers (no-dialog versions) ───────────────────
@@ -4636,7 +4629,7 @@ class GFHApp(tk.Tk):
             def _send():
                 try:
                     sender = WhatsAppSender(status_callback=self.set_status,
-                                           mode=getattr(self, "wa_mode_var", None) and self.wa_mode_var.get() or "desktop")
+                                           mode=getattr(self, "wa_mode_var", tk.StringVar(value="web")).get() or "web")
                     group_name = group_name_for_district(district, self.db)
                     _win_state = self._save_window_state()
                     sender.send_image(group_name, screenshot_path, text_message="Audit actions panel.")
@@ -5734,7 +5727,7 @@ class GFHApp(tk.Tk):
         mode_row = ttk.Frame(mode_frame)
         mode_row.pack(fill="x")
         ttk.Label(mode_row, text="Send reports via:").pack(side="left", padx=(0, 10))
-        self.wa_mode_var = tk.StringVar(value=self.db.get_setting("whatsapp_mode", "desktop"))
+        self.wa_mode_var = tk.StringVar(value=self.db.get_setting("whatsapp_mode", "web"))
         ttk.Radiobutton(mode_row, text="WhatsApp Desktop App (pyautogui)",
                         variable=self.wa_mode_var, value="desktop").pack(side="left", padx=(0, 12))
         ttk.Radiobutton(mode_row, text="WhatsApp Web (browser)",
@@ -7138,7 +7131,7 @@ class GFHApp(tk.Tk):
         try:
             renderer = ImageRenderer()
             sender = WhatsAppSender(status_callback=self.set_status,
-                                    mode=getattr(self, "wa_mode_var", None) and self.wa_mode_var.get() or "desktop")
+                                    mode=getattr(self, "wa_mode_var", tk.StringVar(value="web")).get() or "web")
             batches = self.grouped_batches(rows, mode)
             send_mode_for_file = mode
             for batch_title, district, batch_rows in batches:
@@ -7290,7 +7283,7 @@ class GFHApp(tk.Tk):
     def _send_status_rows(self, rows: List[InventoryStatusRow], mode: str) -> None:
         try:
             sender = WhatsAppSender(status_callback=self.set_status,
-                                    mode=getattr(self, "wa_mode_var", None) and self.wa_mode_var.get() or "desktop")
+                                    mode=getattr(self, "wa_mode_var", tk.StringVar(value="web")).get() or "web")
             batches = self.grouped_status_batches(rows, mode)
             for batch_title, district, batch_rows in batches:
                 group_name = group_name_for_district(district, self.db)
@@ -7426,8 +7419,7 @@ class GFHApp(tk.Tk):
 
     def _send_starting_message_thread(self, districts: List[str]) -> None:
         try:
-            sender = WhatsAppSender(status_callback=self.set_status,
-                                    mode=getattr(self, "wa_mode_var", None) and self.wa_mode_var.get() or "desktop")
+            sender = WhatsAppSender(status_callback=self.set_status, mode="web")
             message = "Please complete an Inventory count in 15 minutes."
             for district in districts:
                 group_name = group_name_for_district(district, self.db)
@@ -7482,7 +7474,7 @@ class GFHApp(tk.Tk):
     def _send_single_reminder_thread(self, districts: List[str], uncleared_rows: List[VarianceRow], reminder_number: int, message: str) -> None:
         try:
             sender = WhatsAppSender(status_callback=self.set_status,
-                                    mode=getattr(self, "wa_mode_var", None) and self.wa_mode_var.get() or "desktop")
+                                    mode=getattr(self, "wa_mode_var", tk.StringVar(value="web")).get() or "web")
             for district in districts:
                 district_rows = [row for row in uncleared_rows if normalize_district(row.district) == normalize_district(district)]
                 if not district_rows:
@@ -7530,7 +7522,7 @@ class GFHApp(tk.Tk):
     def _send_final_district_result_thread(self, districts: List[str]) -> None:
         final_results: List[Dict[str, str]] = []
         try:
-            sender = WhatsAppSender(self.set_status, mode=getattr(self, "wa_mode_var", None) and self.wa_mode_var.get() or "desktop")
+            sender = WhatsAppSender(self.set_status, mode=getattr(self, "wa_mode_var", tk.StringVar(value="web")).get() or "web")  # noqa: E501
             renderer = ImageRenderer()
             all_rows = self.db.get_rows_by_keys(self.loaded_keys)
             self.set_status("Sending final district audit results...")
