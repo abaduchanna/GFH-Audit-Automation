@@ -2669,17 +2669,18 @@ class WhatsAppSender:
         self.log(f"Sent text to {group_name}")
 
     def _send_text_web(self, group_name: str, text_message: str) -> None:
-        """Send text via WhatsApp Web by opening a direct wa.me link."""
+        """Send text via WhatsApp Web — opens in user's Edge profile (port 9227), reuses existing tab."""
         message = safe_text(text_message)
         if not message:
             return
-        import urllib.parse, webbrowser
-        # wa.me won't work for group chats (no phone number) — open web.whatsapp.com
-        # and log the message so the user can paste it manually if needed.
-        url = f"https://web.whatsapp.com"
-        webbrowser.open(url)
-        self.log(f"WhatsApp Web opened. Group: {group_name!r} | Message: {message!r}")
-        self.log("Tip: use WhatsApp Web search (Ctrl+F) to find the group and paste the message.")
+        try:
+            driver = _edge_debug_driver()
+            _find_or_open_tab(driver, _WA_URL)
+        except Exception:
+            import webbrowser
+            webbrowser.open(_WA_URL)
+        self.log(f"WhatsApp Web: {group_name!r} | Message: {message!r}")
+        self.log("Tip: find the group in WhatsApp Web (Ctrl+F) and paste the message.")
 
 
 
@@ -3119,6 +3120,48 @@ def _b2b_wait_for_human_verification_clear(driver, stop_event=None, timeout: int
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Edge remote-debug helpers (port 9227 = user profile with --remote-debugging-port)
+# ─────────────────────────────────────────────────────────────────────────────
+EDGE_DEBUG_PORT = 9227
+_WA_URL = "https://web.whatsapp.com"
+_B2B_URL = "https://wsreports.b2bsoft.com/#"
+_GFH_APP_URL = "https://gfh-telecom-app.web.app/timesheet"
+
+
+def _edge_debug_driver(port: int = EDGE_DEBUG_PORT):
+    """Return a Selenium driver attached to the already-running Edge profile at port."""
+    from selenium import webdriver
+    from selenium.webdriver.edge.options import Options as EdgeOptions
+    opts = EdgeOptions()
+    opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
+    return webdriver.Edge(options=opts)
+
+
+def _find_or_open_tab(driver, url: str) -> None:
+    """Switch to existing tab whose URL starts with url; open one new tab if absent."""
+    prefix = url.split("?")[0].rstrip("/")
+    for handle in driver.window_handles:
+        try:
+            driver.switch_to.window(handle)
+            if driver.current_url.startswith(prefix):
+                return
+        except Exception:
+            continue
+    driver.execute_script("window.open(arguments[0], '_blank');", url)
+    driver.switch_to.window(driver.window_handles[-1])
+
+
+def open_monitoring_tabs(port: int = EDGE_DEBUG_PORT) -> None:
+    """Open WhatsApp, B2B, GFH app tabs in Edge at debug port (call once on scheduler start)."""
+    try:
+        driver = _edge_debug_driver(port)
+        for url in (_WA_URL, _B2B_URL, _GFH_APP_URL):
+            _find_or_open_tab(driver, url)
+    except Exception:
+        pass
+
+
 # B2B Soft Scraper (wsreports.b2bsoft.com)
 # ─────────────────────────────────────────────────────────────────────────────
 class B2BSoftScraper:
@@ -3147,10 +3190,23 @@ class B2BSoftScraper:
         self.driver = None
 
     def _make_driver(self):
+        self._using_debug_port = False
+        # Try user's running Edge profile first (port 9227)
+        try:
+            self.driver = _edge_debug_driver()
+            self.driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+                "behavior": "allow",
+                "downloadPath": str(self.download_dir),
+            })
+            _find_or_open_tab(self.driver, _B2B_URL)
+            self._using_debug_port = True
+            return
+        except Exception:
+            pass
+        # Fallback: new Edge or Chrome instance
         try:
             from selenium import webdriver
             from selenium.webdriver.edge.options import Options as EdgeOptions
-            from selenium.webdriver.edge.service import Service as EdgeService
             opts = EdgeOptions()
             prefs = {
                 "download.default_directory": str(self.download_dir),
@@ -3340,6 +3396,9 @@ class B2BSoftScraper:
         return None
 
     def quit(self):
+        if getattr(self, "_using_debug_port", False):
+            self.driver = None
+            return
         try:
             if self.driver:
                 self.driver.quit()
@@ -3364,6 +3423,20 @@ class TimesheetScraper:
         self.driver = None
 
     def _make_driver(self):
+        self._using_debug_port = False
+        # Try user's running Edge profile first (port 9227)
+        try:
+            self.driver = _edge_debug_driver()
+            self.driver.execute_cdp_cmd("Page.setDownloadBehavior", {
+                "behavior": "allow",
+                "downloadPath": str(self.download_dir),
+            })
+            _find_or_open_tab(self.driver, _GFH_APP_URL)
+            self._using_debug_port = True
+            return
+        except Exception:
+            pass
+        # Fallback: new Edge or Chrome instance
         try:
             from selenium import webdriver
             from selenium.webdriver.edge.options import Options as EdgeOptions
@@ -3450,6 +3523,9 @@ class TimesheetScraper:
         return None
 
     def quit(self):
+        if getattr(self, "_using_debug_port", False):
+            self.driver = None
+            return
         try:
             if self.driver:
                 self.driver.quit()
