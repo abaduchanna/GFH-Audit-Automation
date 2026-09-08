@@ -3464,15 +3464,17 @@ class AuditScheduler:
     def state(self) -> str:
         return self._state
 
-    def start(self, district_times: dict) -> None:
-        """district_times: {district_name: 'HH:MM'} or '' to start immediately."""
+    def start(self, district_times: dict, district_stop_times: Optional[dict] = None) -> None:
+        """district_times: {district: 'HH:MM'} or '' to start immediately.
+        district_stop_times: {district: 'HH:MM'} — when reached, auto-complete + send final."""
         if self._state == "running":
             return
         self._stop_event.clear()
         self._hold_event.set()
         self._state = "running"
         self._thread = threading.Thread(
-            target=self._run_loop, args=(district_times,), daemon=True, name="AuditScheduler")
+            target=self._run_loop, args=(district_times, district_stop_times or {}),
+            daemon=True, name="AuditScheduler")
         self._thread.start()
         self.app._log_scheduler(f"Scheduler started for {len(district_times)} districts.")
 
@@ -3494,10 +3496,11 @@ class AuditScheduler:
         self._state = "stopped"
         self.app._log_scheduler("Scheduler stopped.")
 
-    def _run_loop(self, district_times: dict) -> None:
+    def _run_loop(self, district_times: dict, district_stop_times: dict) -> None:
         import datetime as _dt
-        # Track which districts have fired their start
+        # Track which districts have fired their start / stop
         fired: set = set()
+        completed: set = set()
         # Track last export time
         last_export: Optional[float] = None
         POLL_SEC = self.POLL_INTERVAL_MIN * 60
@@ -3507,7 +3510,7 @@ class AuditScheduler:
             if self._stop_event.is_set():
                 break
             now = _dt.datetime.now()
-            # Check each district start time
+            # ── Check each district start time ────────────────────────────────
             for district, start_str in list(district_times.items()):
                 if district in fired:
                     continue
@@ -3522,9 +3525,26 @@ class AuditScheduler:
                 # Fire start for this district
                 self.app.after(0, lambda d=district: self.app._scheduler_start_district(d))
                 fired.add(district)
-            # Periodic export every POLL_INTERVAL_MIN
+            # ── Check each district stop time ─────────────────────────────────
+            for district, stop_str in list(district_stop_times.items()):
+                if district in completed or district not in fired:
+                    continue
+                if not stop_str:
+                    continue
+                try:
+                    h, m = map(int, stop_str.split(":"))
+                    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if now < target:
+                        continue
+                except Exception:
+                    continue
+                # Stop time reached → auto-complete district
+                self.app.after(0, lambda d=district: self.app._scheduler_auto_complete_district(d))
+                completed.add(district)
+            # ── Periodic export every POLL_INTERVAL_MIN ───────────────────────
             if last_export is None or (time.time() - last_export) >= POLL_SEC:
-                if fired:  # only after at least one district started
+                active = fired - completed
+                if active:  # only while at least one district is still running
                     self.app.after(0, self.app._scheduler_run_export_cycle)
                     last_export = time.time()
             time.sleep(10)
@@ -3641,7 +3661,8 @@ class GFHApp(tk.Tk):
 
         # ── Scheduler state ─────────────────────────────────────────────────
         self._scheduler = AuditScheduler(self)
-        self._sched_time_vars: Dict[str, tk.StringVar] = {}   # district → HH:MM var
+        self._sched_time_vars: Dict[str, tk.StringVar] = {}       # district → start HH:MM
+        self._sched_stop_time_vars: Dict[str, tk.StringVar] = {}  # district → stop HH:MM
         self._sched_log_var = tk.StringVar(value="Scheduler idle.")
         self._auto_import_done = False
         self.summary_text = tk.StringVar(value="No data loaded")
@@ -4141,29 +4162,40 @@ class GFHApp(tk.Tk):
         ).pack(anchor="nw", padx=20)
 
     def _build_scheduler_district_rows(self) -> None:
-        """Build one row per known district with an HH:MM time-entry field."""
+        """Build one row per known district with Start and Stop HH:MM fields."""
         for w in self._sched_frame.winfo_children():
             w.destroy()
         self._sched_time_vars.clear()
+        self._sched_stop_time_vars.clear()
         districts = self._known_districts_for_scheduler()
         if not districts:
             ttk.Label(self._sched_frame,
                       text="No districts found. Load an inventory file or add stores in the Store List tab."
                       ).grid(row=0, column=0, sticky="w")
             return
-        for col_base in range(0, min(len(districts), 6), 2):
-            self._sched_frame.columnconfigure(col_base + 1, weight=1)
+        # Each district occupies 6 columns: label | start entry | "→" | stop entry | hint | spacer
+        COLS_PER = 6
+        per_row = 2  # districts per grid row
+        for idx in range(per_row):
+            self._sched_frame.columnconfigure(idx * COLS_PER + 1, weight=1)
+            self._sched_frame.columnconfigure(idx * COLS_PER + 3, weight=1)
         for idx, dist in enumerate(districts):
-            col = (idx % 3) * 3
-            row = idx // 3
-            var = tk.StringVar(value=self._sched_time_vars.get(dist, tk.StringVar()).get())
-            self._sched_time_vars[dist] = var
-            ttk.Label(self._sched_frame, text=dist, width=18, anchor="e").grid(
-                row=row, column=col, sticky="e", padx=(6, 4), pady=4)
-            ttk.Entry(self._sched_frame, textvariable=var, width=8).grid(
-                row=row, column=col + 1, sticky="w", padx=(0, 16), pady=4)
+            g_col = (idx % per_row) * COLS_PER
+            g_row = idx // per_row
+            start_var = tk.StringVar(value=self._sched_time_vars.get(dist, tk.StringVar()).get())
+            stop_var  = tk.StringVar(value=self._sched_stop_time_vars.get(dist, tk.StringVar()).get())
+            self._sched_time_vars[dist]      = start_var
+            self._sched_stop_time_vars[dist] = stop_var
+            ttk.Label(self._sched_frame, text=dist, width=16, anchor="e").grid(
+                row=g_row, column=g_col, sticky="e", padx=(6, 2), pady=3)
+            ttk.Entry(self._sched_frame, textvariable=start_var, width=7).grid(
+                row=g_row, column=g_col + 1, sticky="w", padx=(0, 2), pady=3)
+            ttk.Label(self._sched_frame, text="→", foreground="#8090b0").grid(
+                row=g_row, column=g_col + 2, padx=(0, 2))
+            ttk.Entry(self._sched_frame, textvariable=stop_var, width=7).grid(
+                row=g_row, column=g_col + 3, sticky="w", padx=(0, 2), pady=3)
             ttk.Label(self._sched_frame, text="HH:MM", foreground="#8090b0").grid(
-                row=row, column=col + 2, sticky="w", padx=(0, 12), pady=4)
+                row=g_row, column=g_col + 4, sticky="w", padx=(0, 14))
 
     def _known_districts_for_scheduler(self) -> List[str]:
         """Return distinct districts from the DB store list."""
@@ -4173,11 +4205,12 @@ class GFHApp(tk.Tk):
             return []
 
     def _sched_start(self) -> None:
-        times = {d: v.get().strip() for d, v in self._sched_time_vars.items()}
-        if not times:
+        start_times = {d: v.get().strip() for d, v in self._sched_time_vars.items()}
+        stop_times  = {d: v.get().strip() for d, v in self._sched_stop_time_vars.items()}
+        if not start_times:
             messagebox.showwarning("No Districts", "No districts to schedule. Import inventory first.", parent=self)
             return
-        self._scheduler.start(times)
+        self._scheduler.start(start_times, stop_times)
         self._log_scheduler("▶ Started.")
 
     def _sched_stop(self) -> None:
@@ -4269,6 +4302,61 @@ class GFHApp(tk.Tk):
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
         threading.Thread(target=_run, daemon=True, name="ExportCycle").start()
+
+    # ── Scheduler auto-complete (stop time reached or all IMEIs cleared) ──────
+    def _scheduler_auto_complete_district(self, district: str) -> None:
+        """Called on main thread when a district's stop time is reached.
+        Checks variance ledger:
+        - zero uncleared rows → 'No Variance / all cleared' path
+        - uncleared rows remain → sends final with outstanding variances
+        In both cases sends the Final District Result to the WhatsApp group.
+        """
+        try:
+            all_rows = self.db.get_rows_by_keys(self.loaded_keys) if self.loaded_keys else []
+        except Exception:
+            all_rows = []
+        district_rows = [r for r in all_rows if normalize_district(r.district) == normalize_district(district)]
+        uncleared = [r for r in district_rows if not r.cleared]
+        uncleared = self.filter_excluded_variance_rows(uncleared) if uncleared else uncleared
+        if not uncleared:
+            reason = "no variance found" if not district_rows else "all variance IMEIs cleared"
+            self._log_scheduler(f"✓ {district}: {reason} — sending final status.")
+        else:
+            self._log_scheduler(f"⏹ {district}: stop time reached ({len(uncleared)} uncleared) — sending final status.")
+        threading.Thread(
+            target=self._send_final_auto,
+            args=([normalize_district(district)],),
+            daemon=True, name="AutoFinalSend"
+        ).start()
+
+    def _send_final_auto(self, districts: List[str]) -> None:
+        """Non-interactive version of _send_final_district_result_thread (no messagebox)."""
+        try:
+            self._send_final_district_result_thread(districts)
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Auto-final send error: {exc}")
+
+    def _check_all_cleared_and_complete(self, district: str) -> None:
+        """Called after every IMEI reconciliation. If all variances for a district are
+        cleared, automatically sends the final status to the WhatsApp group."""
+        try:
+            if not self.loaded_keys:
+                return
+            all_rows = self.db.get_rows_by_keys(self.loaded_keys)
+            district_rows = [r for r in all_rows if normalize_district(r.district) == normalize_district(district)]
+            if not district_rows:
+                return
+            uncleared = self.filter_excluded_variance_rows([r for r in district_rows if not r.cleared])
+            if uncleared:
+                return  # still pending
+            self._log_scheduler(f"✓ All IMEIs cleared for {district} — auto-sending final status.")
+            threading.Thread(
+                target=self._send_final_auto,
+                args=([normalize_district(district)],),
+                daemon=True, name="AllClearedFinalSend"
+            ).start()
+        except Exception as exc:
+            self._log_scheduler(f"⚠ All-cleared check error ({district}): {exc}")
 
     # ── Auto-import stores from inventory count ──────────────────────────────
     def _auto_import_stores_from_inventory(self) -> None:
@@ -4462,7 +4550,7 @@ class GFHApp(tk.Tk):
         for btn in (self._sched_start_btn, self._sched_stop_btn,
                     self._sched_hold_btn, self._sched_resume_btn):
             btn.pack(side="left", padx=(0, 8))
-        ttk.Label(btn_row, text="  Start times per district (HH:MM, 24h):",
+        ttk.Label(btn_row, text="  Start / Stop times per district (HH:MM, 24h):",
                   foreground="#8090b0").pack(side="left", padx=(12, 4))
 
         # District time inputs (compact, inline)
@@ -7079,6 +7167,12 @@ class GFHApp(tk.Tk):
         self.refresh_table()
         action = "cleared" if cleared else "not cleared"
         self.set_status(f"Marked {len(rows)} variance row(s) as {action}.")
+        # If rows were cleared, check whether all variances for each affected
+        # district are now cleared → auto-send final status if so.
+        if cleared:
+            affected_districts = {normalize_district(r.district) for r in rows if safe_text(r.district)}
+            for dist in affected_districts:
+                self.after(500, lambda d=dist: self._check_all_cleared_and_complete(d))
 
     def clear_current_ui(self, silent: bool = False) -> None:
         self.loaded_keys.clear()
