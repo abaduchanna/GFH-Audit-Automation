@@ -4426,6 +4426,8 @@ class GFHApp(tk.Tk):
         # Event districts wait on before sending starting messages.
         # Set by _scheduler_run_export_cycle after first export finishes.
         self._initial_export_done = threading.Event()
+        # Tracks districts whose scheduled start has fired this session.
+        self._scheduler_fired_districts: set = set()
 
         self._scheduler.start(adjusted_times, stop_time=stop_time)
         self._log_scheduler(f"▶ Started. Stops at {stop_time.strftime('%H:%M')}.")
@@ -4495,6 +4497,9 @@ class GFHApp(tk.Tk):
                 ev = getattr(self, "_initial_export_done", None)
                 if ev is not None:
                     ev.wait(timeout=600)  # max 10 min
+                fired_set = getattr(self, "_scheduler_fired_districts", None)
+                if fired_set is not None:
+                    fired_set.add(district)
                 self.after(0, lambda: self._auto_send_starting_message(district))
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ District start error ({district}): {exc}"))
@@ -4550,9 +4555,19 @@ class GFHApp(tk.Tk):
                         if ts_file and ts_file.exists():
                             self.time_sheet_path.set(str(ts_file))
                             self._log_scheduler(f"Loaded timesheet: {ts_file.name}")
-                        if inv_file or ts_file:
+                        # Require both files to call load_variances (avoids missing-file dialog).
+                        both_ready = (
+                            inv_file and inv_file.exists() and
+                            ts_file and ts_file.exists()
+                        )
+                        if both_ready:
                             self.load_variances()
                             self._auto_import_stores_from_inventory()
+                            # Send status image for every district that has fired this session.
+                            for d in list(getattr(self, "_scheduler_fired_districts", set())):
+                                self._auto_send_status_image(d)
+                        elif inv_file or ts_file:
+                            self._log_scheduler("⚠ Only one file downloaded — skipping load_variances until both ready.")
                         if _district_for_send:
                             self._auto_send_variance_image(_district_for_send)
                     except Exception as exc:
