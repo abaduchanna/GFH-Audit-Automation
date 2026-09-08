@@ -4288,24 +4288,33 @@ class GFHApp(tk.Tk):
                       text="No districts found. Load an inventory file or add stores in the Store List tab."
                       ).grid(row=0, column=0, sticky="w")
             return
-        for col_base in range(0, min(len(districts), 6), 2):
-            self._sched_frame.columnconfigure(col_base + 1, weight=1)
+        # 5 cols per group: label | entry | ampm | hint | spacer(weight)
+        for g in range(3):
+            self._sched_frame.columnconfigure(g * 5 + 4, weight=1)
+        # Load saved times from DB
+        import json as _json
+        try:
+            saved = _json.loads(self.db.get_setting("sched_district_times", "{}"))
+        except Exception:
+            saved = {}
         for idx, dist in enumerate(districts):
-            col = (idx % 3) * 4
+            col = (idx % 3) * 5
             row = idx // 3
-            var = tk.StringVar(value="")
-            ampm_var = tk.StringVar(value="AM")
+            saved_val = saved.get(dist, {})
+            var = tk.StringVar(value=saved_val.get("time", ""))
+            ampm_var = tk.StringVar(value=saved_val.get("ampm", "AM"))
             self._sched_time_vars[dist] = var
             self._sched_ampm_vars[dist] = ampm_var
-            ttk.Label(self._sched_frame, text=dist, width=18, anchor="e").grid(
-                row=row, column=col, sticky="e", padx=(6, 4), pady=4)
-            ttk.Entry(self._sched_frame, textvariable=var, width=7).grid(
+            ttk.Label(self._sched_frame, text=dist, anchor="e").grid(
+                row=row, column=col, sticky="e", padx=(6, 2), pady=4)
+            ttk.Entry(self._sched_frame, textvariable=var, width=6).grid(
                 row=row, column=col + 1, sticky="w", padx=(0, 2), pady=4)
             ttk.Combobox(self._sched_frame, textvariable=ampm_var, values=["AM", "PM"],
                          state="readonly", width=4).grid(
                 row=row, column=col + 2, sticky="w", padx=(0, 2), pady=4)
             ttk.Label(self._sched_frame, text="HH:MM", foreground="#8090b0").grid(
-                row=row, column=col + 3, sticky="w", padx=(0, 8), pady=4)
+                row=row, column=col + 3, sticky="w", padx=(0, 4), pady=4)
+            # col+4 is the spacer (weight=1 above)
 
     def _known_districts_for_scheduler(self) -> List[str]:
         """Return distinct districts from the DB store list."""
@@ -4382,6 +4391,21 @@ class GFHApp(tk.Tk):
         self._log_scheduler(f"▶ Started. Stops at {stop_time.strftime('%H:%M')}.")
         # Start WhatsApp notification OCR monitor for auto-IMEI clearing
         self._start_whatsapp_ocr_monitor()
+
+    def _sched_save_times(self) -> None:
+        import json as _json
+        data = {}
+        for dist, var in self._sched_time_vars.items():
+            ampm = self._sched_ampm_vars.get(dist)
+            data[dist] = {
+                "time": var.get().strip(),
+                "ampm": ampm.get() if ampm else "AM",
+            }
+        try:
+            self.db.save_setting("sched_district_times", _json.dumps(data))
+            self.set_status("Scheduler times saved.")
+        except Exception as exc:
+            self.set_status(f"Save failed: {exc}")
 
     def _sched_stop(self) -> None:
         self._scheduler.stop()
@@ -4851,6 +4875,8 @@ class GFHApp(tk.Tk):
         for btn in (self._sched_start_btn, self._sched_stop_btn,
                     self._sched_hold_btn, self._sched_resume_btn):
             btn.pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="💾  Save Times", command=self._sched_save_times).pack(
+            side="left", padx=(0, 8))
         ttk.Label(btn_row, text="  Start times per district (HH:MM AM/PM):",
                   foreground="#8090b0").pack(side="left", padx=(12, 4))
 
