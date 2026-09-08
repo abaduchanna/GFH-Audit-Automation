@@ -16,8 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         app:
-          - GFH_Inventory_Audit
-          - GFH_Inventory_Audit_Timesheet
+          - GFH_Inventory_Audit_Automation
 
     steps:
       - name: Checkout
