@@ -193,31 +193,50 @@ else:
 PORTABLE_APP_DIR = PACKAGE_DIR / "GFH_Inventory_Audit_Data"
 LEGACY_APP_DIR = Path.home() / "GFH_Inventory_Variance_GUI"
 
-# Always use the portable folder next to the script so every laptop sharing
-# the same network/USB location opens the SAME database file.
-# A per-user fallback would silently create per-machine copies — removed.
+def _is_onedrive_path(p: Path) -> bool:
+    """Return True when path is inside a OneDrive-synced folder."""
+    import os
+    p_str = str(p).lower()
+    markers = ["onedrive", "onedrive - "]
+    if any(m in p_str for m in markers):
+        return True
+    for env_var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        od = os.environ.get(env_var, "")
+        if od and str(p).lower().startswith(od.lower()):
+            return True
+    return False
+
 def _choose_app_dir() -> Path:
+    """
+    Prefer the portable folder next to the script so all laptops on a shared
+    network/USB location use the same database.  If the script lives inside a
+    OneDrive-synced folder, fall back to %LOCALAPPDATA% to prevent continuous
+    OneDrive sync activity from the DB polling loop.
+    """
+    import os
+    if _is_onedrive_path(PORTABLE_APP_DIR):
+        local_app = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        candidate = local_app / "GFH_Inventory_Audit_Data"
+    else:
+        candidate = PORTABLE_APP_DIR
     try:
-        PORTABLE_APP_DIR.mkdir(parents=True, exist_ok=True)
-        test_file = PORTABLE_APP_DIR / ".write_test"
+        candidate.mkdir(parents=True, exist_ok=True)
+        test_file = candidate / ".write_test"
         test_file.write_text("ok", encoding="utf-8")
         try:
             test_file.unlink()
         except Exception:
             pass
-        return PORTABLE_APP_DIR
+        return candidate
     except Exception as e:
-        # Cannot write next to the script — tell the user explicitly instead of
-        # silently creating a per-machine copy that goes out of sync.
         import tkinter as _tk, tkinter.messagebox as _mb
         _root = _tk.Tk(); _root.withdraw()
         _mb.showerror(
             "Folder not writable",
-            f"Cannot write to the data folder next to the script:\n"
-            f"  {PORTABLE_APP_DIR}\n\n"
+            f"Cannot write to the data folder:\n"
+            f"  {candidate}\n\n"
             f"Error: {e}\n\n"
-            f"Please run the script from a writable location (e.g. a shared "
-            f"network folder or USB drive) so all laptops share the same database.",
+            f"Please ensure the folder is writable.",
         )
         _root.destroy()
         raise SystemExit(1)
@@ -3642,6 +3661,7 @@ class GFHApp(tk.Tk):
         except Exception:
             self._db_mtime = 0.0
         self._db_sync_paused: bool = False   # paused while THIS instance is writing
+        self._db_sync_after_id = None        # cancellable after() handle
         self.master_store_records = self.db.store_master_records()
         self.current_inventory_records: List[Dict[str, str]] = []
         self.current_time_sheet_records: List[Dict[str, str]] = []
@@ -3680,6 +3700,7 @@ class GFHApp(tk.Tk):
         # ── Scheduler state ─────────────────────────────────────────────────
         self._scheduler = AuditScheduler(self)
         self._sched_time_vars: Dict[str, tk.StringVar] = {}   # district → HH:MM var
+        self._sched_ampm_vars: Dict[str, tk.StringVar] = {}   # district → AM/PM var
         self._sched_log_var = tk.StringVar(value="Scheduler idle.")
         self._auto_import_done = False
         self.summary_text = tk.StringVar(value="No data loaded")
@@ -3722,6 +3743,7 @@ class GFHApp(tk.Tk):
         self._build_ui()
         self.set_status(f"Ready. Data folder: {APP_DIR}")
         self._start_db_sync_poll()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Apply dark colors to all widgets now that they exist
         colors = self.theme_manager.get_colors()
         self.COLOR_BG = colors["bg"]
@@ -4179,10 +4201,11 @@ class GFHApp(tk.Tk):
         ).pack(anchor="nw", padx=20)
 
     def _build_scheduler_district_rows(self) -> None:
-        """Build one row per known district with an HH:MM time-entry field."""
+        """Build one row per known district with HH:MM + AM/PM time-entry fields."""
         for w in self._sched_frame.winfo_children():
             w.destroy()
         self._sched_time_vars.clear()
+        self._sched_ampm_vars.clear()
         districts = self._known_districts_for_scheduler()
         if not districts:
             ttk.Label(self._sched_frame,
@@ -4192,16 +4215,21 @@ class GFHApp(tk.Tk):
         for col_base in range(0, min(len(districts), 6), 2):
             self._sched_frame.columnconfigure(col_base + 1, weight=1)
         for idx, dist in enumerate(districts):
-            col = (idx % 3) * 3
+            col = (idx % 3) * 4
             row = idx // 3
-            var = tk.StringVar(value=self._sched_time_vars.get(dist, tk.StringVar()).get())
+            var = tk.StringVar(value="")
+            ampm_var = tk.StringVar(value="AM")
             self._sched_time_vars[dist] = var
+            self._sched_ampm_vars[dist] = ampm_var
             ttk.Label(self._sched_frame, text=dist, width=18, anchor="e").grid(
                 row=row, column=col, sticky="e", padx=(6, 4), pady=4)
-            ttk.Entry(self._sched_frame, textvariable=var, width=8).grid(
-                row=row, column=col + 1, sticky="w", padx=(0, 16), pady=4)
+            ttk.Entry(self._sched_frame, textvariable=var, width=7).grid(
+                row=row, column=col + 1, sticky="w", padx=(0, 2), pady=4)
+            ttk.Combobox(self._sched_frame, textvariable=ampm_var, values=["AM", "PM"],
+                         state="readonly", width=4).grid(
+                row=row, column=col + 2, sticky="w", padx=(0, 2), pady=4)
             ttk.Label(self._sched_frame, text="HH:MM", foreground="#8090b0").grid(
-                row=row, column=col + 2, sticky="w", padx=(0, 12), pady=4)
+                row=row, column=col + 3, sticky="w", padx=(0, 8), pady=4)
 
     def _known_districts_for_scheduler(self) -> List[str]:
         """Return distinct districts from the DB store list."""
@@ -4210,12 +4238,34 @@ class GFHApp(tk.Tk):
         except Exception:
             return []
 
+    @staticmethod
+    def _to_24h(hhmm: str, ampm: str) -> str:
+        """Convert HH:MM + AM/PM to HH:MM 24-hour string. Returns '' on bad input."""
+        try:
+            h, m = map(int, hhmm.strip().split(":"))
+            ampm = ampm.strip().upper()
+            if ampm == "PM" and h != 12:
+                h += 12
+            elif ampm == "AM" and h == 12:
+                h = 0
+            return f"{h:02d}:{m:02d}"
+        except Exception:
+            return ""
+
     def _sched_start(self) -> None:
         import datetime as _dt
-        times = {d: v.get().strip() for d, v in self._sched_time_vars.items()}
-        if not times:
+        times_raw = {d: v.get().strip() for d, v in self._sched_time_vars.items()}
+        if not times_raw:
             messagebox.showwarning("No Districts", "No districts to schedule. Import inventory first.", parent=self)
             return
+        # Convert 12hr → 24hr for each district
+        times: dict = {}
+        for d, t in times_raw.items():
+            if t:
+                ampm = self._sched_ampm_vars.get(d, tk.StringVar(value="AM")).get()
+                times[d] = self._to_24h(t, ampm)
+            else:
+                times[d] = ""
         # Late-start: if configured start time already passed, start that district immediately
         now = _dt.datetime.now()
         adjusted_times: dict = {}
@@ -4238,7 +4288,9 @@ class GFHApp(tk.Tk):
         stop_time = None
         if stop_time_str:
             try:
-                h, m = map(int, stop_time_str.split(":"))
+                stop_ampm = self._sched_stop_ampm_var.get()
+                t24 = self._to_24h(stop_time_str, stop_ampm)
+                h, m = map(int, t24.split(":"))
                 stop_time = now.replace(hour=h, minute=m, second=0, microsecond=0)
                 if stop_time <= now:
                     stop_time += _dt.timedelta(days=1)
@@ -4723,7 +4775,7 @@ class GFHApp(tk.Tk):
         for btn in (self._sched_start_btn, self._sched_stop_btn,
                     self._sched_hold_btn, self._sched_resume_btn):
             btn.pack(side="left", padx=(0, 8))
-        ttk.Label(btn_row, text="  Start times per district (HH:MM, 24h):",
+        ttk.Label(btn_row, text="  Start times per district (HH:MM AM/PM):",
                   foreground="#8090b0").pack(side="left", padx=(12, 4))
 
         # Duration and global stop time row
@@ -4732,10 +4784,13 @@ class GFHApp(tk.Tk):
         ttk.Label(dur_row, text="Duration (hrs):").pack(side="left", padx=(0, 4))
         self._sched_duration_var = tk.StringVar(value="12")
         ttk.Entry(dur_row, textvariable=self._sched_duration_var, width=6).pack(side="left", padx=(0, 12))
-        ttk.Label(dur_row, text="Global stop time (HH:MM):").pack(side="left", padx=(0, 4))
+        ttk.Label(dur_row, text="Global stop time:").pack(side="left", padx=(0, 4))
         self._sched_stop_time_var = tk.StringVar(value="")
-        ttk.Entry(dur_row, textvariable=self._sched_stop_time_var, width=8).pack(side="left", padx=(0, 4))
-        ttk.Label(dur_row, text="(24h; overrides duration when set)", foreground="#8090b0").pack(side="left")
+        ttk.Entry(dur_row, textvariable=self._sched_stop_time_var, width=7).pack(side="left", padx=(0, 2))
+        self._sched_stop_ampm_var = tk.StringVar(value="PM")
+        ttk.Combobox(dur_row, textvariable=self._sched_stop_ampm_var, values=["AM", "PM"],
+                     state="readonly", width=4).pack(side="left", padx=(0, 4))
+        ttk.Label(dur_row, text="HH:MM AM/PM — overrides duration when set", foreground="#8090b0").pack(side="left")
 
         # District time inputs (compact, inline)
         self._sched_frame = ttk.Frame(sched_box)
@@ -7384,7 +7439,7 @@ class GFHApp(tk.Tk):
         self._schedule_db_sync()
 
     def _schedule_db_sync(self) -> None:
-        self.after(2000, self._check_db_sync)
+        self._db_sync_after_id = self.after(2000, self._check_db_sync)
 
     def _check_db_sync(self) -> None:
         """Called every 2 s.  If another instance modified the DB, refresh GUI."""
@@ -7410,6 +7465,24 @@ class GFHApp(tk.Tk):
         except Exception:
             pass
         self._schedule_db_sync()
+
+    def _on_close(self) -> None:
+        """Cancel background loops then destroy the window."""
+        try:
+            if self._db_sync_after_id is not None:
+                self.after_cancel(self._db_sync_after_id)
+                self._db_sync_after_id = None
+        except Exception:
+            pass
+        try:
+            self._wa_ocr_running = False
+        except Exception:
+            pass
+        try:
+            self._scheduler.stop()
+        except Exception:
+            pass
+        self.destroy()
 
     def _db_write(self, fn, *args, **kwargs):
         """Wrap any DB write so the sync poller does not re-trigger on our own write."""
