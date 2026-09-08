@@ -181,31 +181,50 @@ else:
 PORTABLE_APP_DIR = PACKAGE_DIR / "GFH_Inventory_Audit_Data"
 LEGACY_APP_DIR = Path.home() / "GFH_Inventory_Variance_GUI"
 
-# Always use the portable folder next to the script so every laptop sharing
-# the same network/USB location opens the SAME database file.
-# A per-user fallback would silently create per-machine copies — removed.
+def _is_onedrive_path(p: Path) -> bool:
+    """Return True when path is inside a OneDrive-synced folder."""
+    import os
+    p_str = str(p).lower()
+    markers = ["onedrive", "onedrive - "]
+    if any(m in p_str for m in markers):
+        return True
+    for env_var in ("OneDrive", "OneDriveConsumer", "OneDriveCommercial"):
+        od = os.environ.get(env_var, "")
+        if od and str(p).lower().startswith(od.lower()):
+            return True
+    return False
+
 def _choose_app_dir() -> Path:
+    """
+    Prefer the portable folder next to the script so all laptops on a shared
+    network/USB location use the same database.  If the script lives inside a
+    OneDrive-synced folder, fall back to %LOCALAPPDATA% to prevent continuous
+    OneDrive sync activity from the DB polling loop.
+    """
+    import os
+    if _is_onedrive_path(PORTABLE_APP_DIR):
+        local_app = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        candidate = local_app / "GFH_Inventory_Audit_Data"
+    else:
+        candidate = PORTABLE_APP_DIR
     try:
-        PORTABLE_APP_DIR.mkdir(parents=True, exist_ok=True)
-        test_file = PORTABLE_APP_DIR / ".write_test"
+        candidate.mkdir(parents=True, exist_ok=True)
+        test_file = candidate / ".write_test"
         test_file.write_text("ok", encoding="utf-8")
         try:
             test_file.unlink()
         except Exception:
             pass
-        return PORTABLE_APP_DIR
+        return candidate
     except Exception as e:
-        # Cannot write next to the script — tell the user explicitly instead of
-        # silently creating a per-machine copy that goes out of sync.
         import tkinter as _tk, tkinter.messagebox as _mb
         _root = _tk.Tk(); _root.withdraw()
         _mb.showerror(
             "Folder not writable",
-            f"Cannot write to the data folder next to the script:\n"
-            f"  {PORTABLE_APP_DIR}\n\n"
+            f"Cannot write to the data folder:\n"
+            f"  {candidate}\n\n"
             f"Error: {e}\n\n"
-            f"Please run the script from a writable location (e.g. a shared "
-            f"network folder or USB drive) so all laptops share the same database.",
+            f"Please ensure the folder is writable.",
         )
         _root.destroy()
         raise SystemExit(1)
@@ -2458,6 +2477,7 @@ class GFHApp(tk.Tk):
         except Exception:
             self._db_mtime = 0.0
         self._db_sync_paused: bool = False   # paused while THIS instance is writing
+        self._db_sync_after_id = None        # cancellable after() handle
         self.master_store_records = self.db.store_master_records()
         self.current_inventory_records: List[Dict[str, str]] = []
         self.current_time_sheet_records: List[Dict[str, str]] = []
@@ -2523,6 +2543,7 @@ class GFHApp(tk.Tk):
         self._build_ui()
         self.set_status(f"Ready. Data folder: {APP_DIR}")
         self._start_db_sync_poll()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Apply dark colors to all widgets now that they exist
         colors = self.theme_manager.get_colors()
         self.COLOR_BG = colors["bg"]
@@ -5142,7 +5163,7 @@ class GFHApp(tk.Tk):
         self._schedule_db_sync()
 
     def _schedule_db_sync(self) -> None:
-        self.after(2000, self._check_db_sync)
+        self._db_sync_after_id = self.after(2000, self._check_db_sync)
 
     def _check_db_sync(self) -> None:
         """Called every 2 s.  If another instance modified the DB, refresh GUI."""
@@ -5168,6 +5189,16 @@ class GFHApp(tk.Tk):
         except Exception:
             pass
         self._schedule_db_sync()
+
+    def _on_close(self) -> None:
+        """Cancel background loops then destroy the window."""
+        try:
+            if self._db_sync_after_id is not None:
+                self.after_cancel(self._db_sync_after_id)
+                self._db_sync_after_id = None
+        except Exception:
+            pass
+        self.destroy()
 
     def _db_write(self, fn, *args, **kwargs):
         """Wrap any DB write so the sync poller does not re-trigger on our own write."""
