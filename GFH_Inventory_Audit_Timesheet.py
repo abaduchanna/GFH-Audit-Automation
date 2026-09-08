@@ -159,12 +159,13 @@ except Exception as exc:
     raise RuntimeError("Tkinter is required. Use the standard Windows Python installer.") from exc
 
 try:
-    from PIL import Image, ImageDraw, ImageFont, ImageTk
+    from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageGrab
 except Exception:
     Image = None
     ImageDraw = None
     ImageFont = None
     ImageTk = None
+    ImageGrab = None
 
 try:
     import openpyxl
@@ -3464,15 +3465,16 @@ class AuditScheduler:
     def state(self) -> str:
         return self._state
 
-    def start(self, district_times: dict) -> None:
-        """district_times: {district_name: 'HH:MM'} or '' to start immediately."""
+    def start(self, district_times: dict, stop_time=None) -> None:
+        """district_times: {district_name: 'HH:MM'} or '' to start immediately.
+        stop_time: datetime when scheduler auto-stops (None = run indefinitely)."""
         if self._state == "running":
             return
         self._stop_event.clear()
         self._hold_event.set()
         self._state = "running"
         self._thread = threading.Thread(
-            target=self._run_loop, args=(district_times,), daemon=True, name="AuditScheduler")
+            target=self._run_loop, args=(district_times, stop_time), daemon=True, name="AuditScheduler")
         self._thread.start()
         self.app._log_scheduler(f"Scheduler started for {len(district_times)} districts.")
 
@@ -3494,20 +3496,33 @@ class AuditScheduler:
         self._state = "stopped"
         self.app._log_scheduler("Scheduler stopped.")
 
-    def _run_loop(self, district_times: dict) -> None:
+    def _run_loop(self, district_times: dict, stop_time=None) -> None:
         import datetime as _dt
-        # Track which districts have fired their start
-        fired: set = set()
-        # Track last export time
-        last_export: Optional[float] = None
-        POLL_SEC = self.POLL_INTERVAL_MIN * 60
+        # fired[district] = {"start_ts": float, "export_done": bool, "reminders_sent": int, "final_sent": bool}
+        fired: dict = {}
+        last_reextract: Optional[float] = None
+        INITIAL_EXPORT_SEC = 15 * 60   # 15 min after district starts
+        RE_EXTRACT_SEC = 30 * 60       # re-extract B2B + GFH every 30 min
+        REMINDER_DELAYS = [30 * 60, 60 * 60, 90 * 60]  # 30, 60, 90 min after start
 
         while not self._stop_event.is_set():
-            self._hold_event.wait()          # blocks while held
+            self._hold_event.wait()
             if self._stop_event.is_set():
                 break
             now = _dt.datetime.now()
-            # Check each district start time
+            now_ts = time.time()
+
+            # Check global stop time
+            if stop_time and now >= stop_time:
+                self.app._log_scheduler("⏹ Stop time reached. Sending final results.")
+                for district in list(fired.keys()):
+                    state = fired[district]
+                    if not state.get("final_sent"):
+                        state["final_sent"] = True
+                        self.app.after(0, lambda d=district: self.app._auto_send_final_result(d))
+                break
+
+            # Fire district starts
             for district, start_str in list(district_times.items()):
                 if district in fired:
                     continue
@@ -3519,14 +3534,37 @@ class AuditScheduler:
                             continue
                     except Exception:
                         pass
-                # Fire start for this district
+                fired[district] = {"start_ts": now_ts, "export_done": False, "reminders_sent": 0, "final_sent": False}
                 self.app.after(0, lambda d=district: self.app._scheduler_start_district(d))
-                fired.add(district)
-            # Periodic export every POLL_INTERVAL_MIN
-            if last_export is None or (time.time() - last_export) >= POLL_SEC:
-                if fired:  # only after at least one district started
-                    self.app.after(0, self.app._scheduler_run_export_cycle)
-                    last_export = time.time()
+
+            # Per-district: initial export at 15 min, then reminders at 30/60/90 min
+            for district, state in list(fired.items()):
+                elapsed = now_ts - state["start_ts"]
+
+                # Initial export + variance image at 15 min
+                if not state.get("export_done") and elapsed >= INITIAL_EXPORT_SEC:
+                    state["export_done"] = True
+                    self.app.after(0, lambda d=district: self.app._scheduler_run_export_cycle(district=d))
+
+                # Reminders at 30, 60, 90 min
+                reminders_sent = state.get("reminders_sent", 0)
+                for i, delay in enumerate(REMINDER_DELAYS):
+                    if reminders_sent <= i and elapsed >= delay:
+                        state["reminders_sent"] = i + 1
+                        reminder_num = i + 1
+                        self.app.after(0, lambda d=district, r=reminder_num: self.app._auto_send_reminder(d, r))
+                        break
+
+                # Final result at reminder 3 + 30 min (t+120 min) if not yet sent
+                if not state.get("final_sent") and elapsed >= 120 * 60:
+                    state["final_sent"] = True
+                    self.app.after(0, lambda d=district: self.app._auto_send_final_result(d))
+
+            # Global re-extract B2B + GFH every 30 min (only after at least one district started)
+            if fired and (last_reextract is None or (now_ts - last_reextract) >= RE_EXTRACT_SEC):
+                self.app.after(0, self.app._scheduler_run_export_cycle)
+                last_reextract = now_ts
+
             time.sleep(10)
         self._state = "stopped"
 
@@ -3981,7 +4019,7 @@ class GFHApp(tk.Tk):
         self.notebook.add(self.dm_tab, text="District DMs")
         self.notebook.add(self.exclusion_tab, text="Excluded Devices")
         self.notebook.add(self.credentials_tab, text="Portal Credentials")
-        self.notebook.add(self.scheduler_tab, text="Audit Scheduler")
+        # Audit Scheduler tab removed — controls embedded in Inventory Audit Status tab
 
         self._build_status_tab()
         self._build_audit_tab()
@@ -4173,15 +4211,53 @@ class GFHApp(tk.Tk):
             return []
 
     def _sched_start(self) -> None:
+        import datetime as _dt
         times = {d: v.get().strip() for d, v in self._sched_time_vars.items()}
         if not times:
             messagebox.showwarning("No Districts", "No districts to schedule. Import inventory first.", parent=self)
             return
-        self._scheduler.start(times)
-        self._log_scheduler("▶ Started.")
+        # Late-start: if configured start time already passed, start that district immediately
+        now = _dt.datetime.now()
+        adjusted_times: dict = {}
+        for district, t in times.items():
+            if t:
+                try:
+                    h, m = map(int, t.split(":"))
+                    target = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                    if now >= target:
+                        adjusted_times[district] = ""  # start immediately
+                        self._log_scheduler(f"⚡ {district}: {t} already passed — starting immediately.")
+                    else:
+                        adjusted_times[district] = t
+                except Exception:
+                    adjusted_times[district] = t
+            else:
+                adjusted_times[district] = t
+        # Compute stop time: explicit global stop time overrides duration
+        stop_time_str = self._sched_stop_time_var.get().strip()
+        stop_time = None
+        if stop_time_str:
+            try:
+                h, m = map(int, stop_time_str.split(":"))
+                stop_time = now.replace(hour=h, minute=m, second=0, microsecond=0)
+                if stop_time <= now:
+                    stop_time += _dt.timedelta(days=1)
+            except Exception:
+                pass
+        if stop_time is None:
+            try:
+                dur_h = float(self._sched_duration_var.get().strip() or "12")
+            except Exception:
+                dur_h = 12.0
+            stop_time = now + _dt.timedelta(hours=dur_h)
+        self._scheduler.start(adjusted_times, stop_time=stop_time)
+        self._log_scheduler(f"▶ Started. Stops at {stop_time.strftime('%H:%M')}.")
+        # Start WhatsApp notification OCR monitor for auto-IMEI clearing
+        self._start_whatsapp_ocr_monitor()
 
     def _sched_stop(self) -> None:
         self._scheduler.stop()
+        self._wa_ocr_running = False
 
     def _sched_hold(self) -> None:
         self._scheduler.hold()
@@ -4204,15 +4280,24 @@ class GFHApp(tk.Tk):
 
     # ── Scheduler callbacks (run on main thread via after()) ────────────────
     def _scheduler_start_district(self, district: str) -> None:
-        """Send the starting WhatsApp message for a district."""
-        self._log_scheduler(f"Sending starting message → {district}")
-        try:
-            self.send_starting_message()
-        except Exception as exc:
-            self._log_scheduler(f"⚠ Starting message error: {exc}")
+        """Kick off a district audit: status image → starting message → actions panel screenshot."""
+        self._log_scheduler(f"▶ Starting district: {district}")
+        def _run():
+            try:
+                # 1. Send Inventory Audit Status image for this district
+                self.after(0, lambda: self._auto_send_status_image(district))
+                time.sleep(5)
+                # 2. Send starting message
+                self.after(0, lambda: self._auto_send_starting_message(district))
+                time.sleep(5)
+                # 3. Capture and send actions panel screenshot
+                self.after(0, lambda: self._send_actions_panel_screenshot(district))
+            except Exception as exc:
+                self.after(0, lambda: self._log_scheduler(f"⚠ District start error ({district}): {exc}"))
+        threading.Thread(target=_run, daemon=True, name=f"StartDistrict-{district}").start()
 
-    def _scheduler_run_export_cycle(self) -> None:
-        """Export B2B + Timesheet files, reload variances, send status."""
+    def _scheduler_run_export_cycle(self, district: str = None) -> None:
+        """Export B2B + Timesheet files, reload variances, optionally send variance image."""
         self._log_scheduler("⟳ Running export cycle…")
         def _run():
             try:
@@ -4251,7 +4336,8 @@ class GFHApp(tk.Tk):
                 finally:
                     ts.quit()
 
-                # Reload variances and send status
+                # Reload variances and optionally send variance image
+                _district_for_send = district
                 def _reload_and_send():
                     try:
                         if inv_file and inv_file.exists():
@@ -4263,12 +4349,187 @@ class GFHApp(tk.Tk):
                         if inv_file or ts_file:
                             self.load_variances()
                             self._auto_import_stores_from_inventory()
+                        if _district_for_send:
+                            self._auto_send_variance_image(_district_for_send)
                     except Exception as exc:
                         self._log_scheduler(f"⚠ Reload error: {exc}")
                 self.after(0, _reload_and_send)
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
         threading.Thread(target=_run, daemon=True, name="ExportCycle").start()
+
+    # ── Scheduler automation helpers (no-dialog versions) ───────────────────
+
+    def _capture_tab_screenshot(self, tab_widget) -> Optional[Path]:
+        """Take a screenshot of a specific tab widget and return the saved path."""
+        try:
+            if Image is None:
+                return None
+            tab_widget.update_idletasks()
+            x = tab_widget.winfo_rootx()
+            y = tab_widget.winfo_rooty()
+            w = tab_widget.winfo_width()
+            h = tab_widget.winfo_height()
+            import datetime as _dt
+            ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+            out_path = EXPORT_DIR / f"tab_screenshot_{ts}.png"
+            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+            img.save(str(out_path))
+            return out_path
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Screenshot error: {exc}")
+            return None
+
+    def _auto_send_status_image(self, district: str) -> None:
+        """Send Inventory Audit Status image for a district without confirmation dialog."""
+        try:
+            rows = [row for row in self.status_rows if normalize_district(row.district) == normalize_district(district)]
+            if not rows:
+                self._log_scheduler(f"⚠ No status rows for district: {district}")
+                return
+            self._log_scheduler(f"📸 Sending status image → {district} ({len(rows)} rows)")
+            threading.Thread(target=self._send_status_rows, args=(rows, "district"), daemon=True).start()
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Status image error ({district}): {exc}")
+
+    def _auto_send_starting_message(self, district: str) -> None:
+        """Send starting message to a district WhatsApp group without confirmation dialog."""
+        try:
+            self._log_scheduler(f"💬 Sending starting message → {district}")
+            districts = [normalize_district(district)]
+            threading.Thread(target=self._send_starting_message_thread, args=(districts,), daemon=True).start()
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Starting message error ({district}): {exc}")
+
+    def _send_actions_panel_screenshot(self, district: str) -> None:
+        """Capture the Variance Audit tab and send it to the district WhatsApp group."""
+        try:
+            screenshot_path = self._capture_tab_screenshot(self.audit_tab)
+            if not screenshot_path or not screenshot_path.exists():
+                self._log_scheduler(f"⚠ Actions panel screenshot failed for {district}")
+                return
+            self._log_scheduler(f"📷 Sending actions panel screenshot → {district}")
+            def _send():
+                try:
+                    sender = WhatsAppSender(status_callback=self.set_status,
+                                           mode=getattr(self, "wa_mode_var", None) and self.wa_mode_var.get() or "desktop")
+                    group_name = group_name_for_district(district, self.db)
+                    _win_state = self._save_window_state()
+                    sender.send_image(group_name, screenshot_path, text_message="Audit actions panel.")
+                    self._restore_window_state(_win_state)
+                    self._log_scheduler(f"✓ Actions panel sent to {group_name}")
+                except Exception as exc:
+                    self._log_scheduler(f"⚠ Actions panel send error: {exc}")
+            threading.Thread(target=_send, daemon=True).start()
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Actions panel screenshot error ({district}): {exc}")
+
+    def _auto_send_variance_image(self, district: str) -> None:
+        """Send all pending variance rows for a district without confirmation dialog."""
+        try:
+            if not self.data_loaded:
+                return
+            all_rows = self.db.get_rows_by_keys(self.loaded_keys)
+            rows = [row for row in all_rows
+                    if normalize_district(row.district) == normalize_district(district) and not row.cleared]
+            rows = self.filter_excluded_variance_rows(rows)
+            if not rows:
+                self._log_scheduler(f"✓ No pending variances for {district}")
+                return
+            self._log_scheduler(f"📊 Sending variance image → {district} ({len(rows)} rows)")
+            threading.Thread(target=self._send_rows, args=(rows, "district", False), daemon=True).start()
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Variance image error ({district}): {exc}")
+
+    def _auto_send_reminder(self, district: str, reminder_number: int) -> None:
+        """Send reminder N to a district without confirmation dialog."""
+        reminder_messages = {
+            1: "Please clear the pending variances.",
+            2: "This is the second reminder. Please clear the pending variances immediately.",
+            3: "Final reminder. Uncleared variances will be reported.",
+        }
+        try:
+            if not self.data_loaded:
+                return
+            all_rows = self.db.get_rows_by_keys(self.loaded_keys)
+            uncleared = [row for row in all_rows
+                         if normalize_district(row.district) == normalize_district(district) and not row.cleared]
+            uncleared = self.filter_excluded_variance_rows(uncleared)
+            if not uncleared:
+                self._log_scheduler(f"✓ {district}: all variances cleared — skipping reminder {reminder_number}")
+                return
+            message = reminder_messages.get(reminder_number, "Please clear the pending variances.")
+            self._log_scheduler(f"🔔 Sending reminder {reminder_number}/3 → {district}")
+            districts = [normalize_district(district)]
+            threading.Thread(
+                target=self._send_single_reminder_thread,
+                args=(districts, uncleared, reminder_number, message), daemon=True).start()
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Reminder {reminder_number} error ({district}): {exc}")
+
+    def _auto_send_final_result(self, district: str) -> None:
+        """Send final district audit result without confirmation dialog."""
+        try:
+            self._log_scheduler(f"🏁 Sending final result → {district}")
+            districts = [normalize_district(district)]
+            threading.Thread(target=self._send_final_district_result_thread, args=(districts,), daemon=True).start()
+        except Exception as exc:
+            self._log_scheduler(f"⚠ Final result error ({district}): {exc}")
+
+    def _start_whatsapp_ocr_monitor(self) -> None:
+        """Start background thread that reads WhatsApp notification screenshots via Tesseract OCR
+        and auto-marks found IMEI numbers as cleared in the variance DB."""
+        if getattr(self, "_wa_ocr_running", False):
+            return
+        self._wa_ocr_running = True
+        threading.Thread(target=self._whatsapp_ocr_loop, daemon=True, name="WhatsAppOCR").start()
+        self._log_scheduler("👁 WhatsApp OCR monitor started.")
+
+    def _whatsapp_ocr_loop(self) -> None:
+        """Continuously grab the screen area where WhatsApp notifications appear and read IMEIs."""
+        import re as _re
+        import datetime as _dt
+        try:
+            import pytesseract
+        except ImportError:
+            self.after(0, lambda: self._log_scheduler("⚠ pytesseract not installed — OCR monitor disabled."))
+            self._wa_ocr_running = False
+            return
+
+        seen_imeis: set = set()
+        while getattr(self, "_wa_ocr_running", False):
+            try:
+                # Grab notification area at top of screen (Windows toast region)
+                notif_img = ImageGrab.grab(bbox=(0, 0, 600, 200))
+                text = pytesseract.image_to_string(notif_img)
+                # Extract 15-digit IMEI patterns
+                imei_pattern = _re.compile(r'\b\d{15}\b')
+                found = imei_pattern.findall(text)
+                for imei in found:
+                    if imei in seen_imeis:
+                        continue
+                    seen_imeis.add(imei)
+                    self.after(0, lambda i=imei: self._ocr_clear_imei(i))
+            except Exception:
+                pass
+            time.sleep(5)
+
+    def _ocr_clear_imei(self, imei: str) -> None:
+        """Mark a variance row with the given IMEI as cleared (found via OCR)."""
+        try:
+            if not self.data_loaded:
+                return
+            rows = self.db.get_rows_by_keys(self.loaded_keys)
+            matches = [row for row in rows if row.imei and row.imei.strip() == imei and not row.cleared]
+            if matches:
+                def _do():
+                    for row in matches:
+                        self.db.set_cleared(row.key, True)
+                self._db_write(_do)
+                self.refresh_table()
+                self._log_scheduler(f"👁 OCR: auto-cleared IMEI {imei} ({len(matches)} row(s))")
+        except Exception as exc:
+            self._log_scheduler(f"⚠ OCR clear error for IMEI {imei}: {exc}")
 
     # ── Auto-import stores from inventory count ──────────────────────────────
     def _auto_import_stores_from_inventory(self) -> None:
@@ -4464,6 +4725,17 @@ class GFHApp(tk.Tk):
             btn.pack(side="left", padx=(0, 8))
         ttk.Label(btn_row, text="  Start times per district (HH:MM, 24h):",
                   foreground="#8090b0").pack(side="left", padx=(12, 4))
+
+        # Duration and global stop time row
+        dur_row = ttk.Frame(sched_box)
+        dur_row.pack(fill="x", pady=(2, 4))
+        ttk.Label(dur_row, text="Duration (hrs):").pack(side="left", padx=(0, 4))
+        self._sched_duration_var = tk.StringVar(value="12")
+        ttk.Entry(dur_row, textvariable=self._sched_duration_var, width=6).pack(side="left", padx=(0, 12))
+        ttk.Label(dur_row, text="Global stop time (HH:MM):").pack(side="left", padx=(0, 4))
+        self._sched_stop_time_var = tk.StringVar(value="")
+        ttk.Entry(dur_row, textvariable=self._sched_stop_time_var, width=8).pack(side="left", padx=(0, 4))
+        ttk.Label(dur_row, text="(24h; overrides duration when set)", foreground="#8090b0").pack(side="left")
 
         # District time inputs (compact, inline)
         self._sched_frame = ttk.Frame(sched_box)
