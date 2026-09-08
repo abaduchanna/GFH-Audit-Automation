@@ -4560,11 +4560,22 @@ class GFHApp(tk.Tk):
                             self._scheduler_pending_messages = set(fired)
                             pending = self._scheduler_pending_messages
                         unsent = [d for d in fired if d in pending]
-                        for d in unsent:
-                            self._auto_send_starting_message(d)
-                            if both_ready:
-                                self._auto_send_status_image(d)
-                            pending.discard(d)
+                        if unsent:
+                            # One thread sends all districts sequentially — no concurrent UI fight
+                            # (critical for desktop mode; web mode also benefits from sequential tab use).
+                            for d in unsent:
+                                self._log_scheduler(f"💬 Sending starting message → {d}")
+                            normalized = [normalize_district(d) for d in unsent]
+                            threading.Thread(
+                                target=self._send_starting_message_thread,
+                                args=(normalized,),
+                                daemon=True,
+                                name="StartingMessages",
+                            ).start()
+                            for d in unsent:
+                                if both_ready:
+                                    self._auto_send_status_image(d)
+                                pending.discard(d)
 
                         if _district_for_send:
                             self._auto_send_variance_image(_district_for_send)
@@ -7419,7 +7430,8 @@ class GFHApp(tk.Tk):
 
     def _send_starting_message_thread(self, districts: List[str]) -> None:
         try:
-            sender = WhatsAppSender(status_callback=self.set_status, mode="web")
+            sender = WhatsAppSender(status_callback=self.set_status,
+                                    mode=getattr(self, "wa_mode_var", tk.StringVar(value="web")).get() or "web")
             message = "Please complete an Inventory count in 15 minutes."
             for district in districts:
                 group_name = group_name_for_district(district, self.db)
