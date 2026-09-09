@@ -4144,11 +4144,12 @@ class GFHApp(tk.Tk):
         _tog_frame.pack(side="right", padx=(0, 18), pady=9)
         _tog_frame._tag = "header"
         self._theme_btn = tk.Button(
-            _tog_frame, text="🌙" if self.theme_manager.current_theme == "dark" else "☀️",
-            bg=self.COLOR_RED, fg="white",
-            activebackground="#c9401a", activeforeground="white",
-            font=("Segoe UI", 10), width=3, relief="flat",
-            highlightthickness=0, borderwidth=0,
+            _tog_frame,
+            text="☀️" if self.theme_manager.current_theme == "dark" else "🌙",
+            bg=self.COLOR_NAVY, fg="white",
+            activebackground=self.COLOR_RED, activeforeground="white",
+            font=("Segoe UI Emoji", 13), width=3, relief="flat",
+            highlightthickness=0, borderwidth=0, cursor="hand2",
             command=self._toggle_theme
         )
         self._theme_btn.pack()
@@ -4888,7 +4889,7 @@ class GFHApp(tk.Tk):
         self.theme_manager.current_theme = new_theme
         self.theme_manager.save_theme(new_theme)
         if hasattr(self, "_theme_btn"):
-            self._theme_btn.configure(text="🌙" if new_theme == "dark" else "☀️")
+            self._theme_btn.configure(text="☀️" if new_theme == "dark" else "🌙")
         self._apply_theme()
 
     def _apply_theme(self, colors=None):
@@ -7330,8 +7331,10 @@ class GFHApp(tk.Tk):
         return path
 
     def _send_status_rows(self, rows: List[InventoryStatusRow], mode: str) -> None:
+        def _status(msg):
+            self.after(0, lambda: self.set_status(msg))
         try:
-            sender = WhatsAppSender(status_callback=self.set_status,
+            sender = WhatsAppSender(status_callback=lambda m: _status(m),
                                     mode=getattr(self, "wa_mode_var", tk.StringVar(value="web")).get() or "web")
             batches = self.grouped_status_batches(rows, mode)
             for batch_title, district, batch_rows in batches:
@@ -7339,23 +7342,23 @@ class GFHApp(tk.Tk):
                 for chunk_no, chunk_rows in enumerate(self.chunks(batch_rows, 28), start=1):
                     title = batch_title if len(batch_rows) <= 28 else f"{batch_title} | Part {chunk_no}"
                     image_path = self._render_status_rows(title, chunk_rows, mode="inventory status")
-                    self.set_status(f"Sending Inventory Audit Status with {len(chunk_rows)} row(s) to {group_name}. {title}.")
+                    _status(f"Sending Inventory Audit Status with {len(chunk_rows)} row(s) to {group_name}. {title}.")
                     _win_state = self._save_window_state()
                     sender.send_image(group_name, image_path, text_message=self.inventory_status_message())
                     self._restore_window_state(_win_state)
                     self.db.mark_status_sent(chunk_rows)
                     pending_message = self.pending_inventory_count_message(chunk_rows)
                     if pending_message:
-                        self.set_status(f"Sending incomplete inventory count reminder to {group_name}.")
+                        _status(f"Sending incomplete inventory count reminder to {group_name}.")
                         _win_state2 = self._save_window_state()
                         sender.send_text(group_name, pending_message)
                         self._restore_window_state(_win_state2)
-            self.refresh_status_table()
-            self.set_status("Inventory Audit Status image sending completed.")
+            self.after(0, self.refresh_status_table)
+            _status("Inventory Audit Status image sending completed.")
         except Exception as exc:
             traceback.print_exc()
-            messagebox.showerror("Send failed", str(exc))
-            self.set_status("Inventory Audit Status send failed.")
+            self.after(0, lambda: messagebox.showerror("Send failed", str(exc), parent=self))
+            _status("Inventory Audit Status send failed.")
 
     @staticmethod
     def format_store_list_caption(stores: List[str]) -> str:
