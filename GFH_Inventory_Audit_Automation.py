@@ -2471,19 +2471,53 @@ class WhatsAppSender:
     def log(self, text: str) -> None:
         self.status_callback(text)
 
-    def _force_focus_whatsapp(self) -> bool:
-        """Focus WhatsApp Desktop window using ctypes (most reliable on Win10/11).
-        Same approach as GFH_Inventory_Audit.py — simple and proven to work."""
+    def _find_whatsapp_hwnd(self) -> int:
+        """Return hwnd of first visible WhatsApp Desktop window, or 0."""
         try:
-            import ctypes
             import win32gui
             found = []
             def _cb(hwnd, _):
                 if win32gui.IsWindowVisible(hwnd) and "whatsapp" in (win32gui.GetWindowText(hwnd) or "").lower():
                     found.append(hwnd)
             win32gui.EnumWindows(_cb, None)
-            if found:
-                hwnd = found[0]
+            return found[0] if found else 0
+        except Exception:
+            return 0
+
+    def _save_whatsapp_rect(self) -> tuple:
+        """Save WhatsApp window rect before focus (snap layout preservation)."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            hwnd = self._find_whatsapp_hwnd()
+            if not hwnd:
+                return (0, None)
+            rect = wintypes.RECT()
+            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            return (hwnd, (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
+        except Exception:
+            return (0, None)
+
+    def _restore_whatsapp_rect(self, hwnd: int, saved_rect: tuple) -> None:
+        """Restore WhatsApp window to saved rect so snap layout is not disrupted."""
+        if not hwnd or not saved_rect:
+            return
+        try:
+            import ctypes
+            x, y, w, h = saved_rect
+            SWP_NOZORDER = 0x0004
+            SWP_NOACTIVATE = 0x0010
+            ctypes.windll.user32.SetWindowPos(hwnd, 0, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE)
+        except Exception:
+            pass
+
+    def _force_focus_whatsapp(self) -> bool:
+        """Focus WhatsApp Desktop window using ctypes (most reliable on Win10/11).
+        Same approach as GFH_Inventory_Audit.py — simple and proven to work."""
+        try:
+            import ctypes
+            hwnd = self._find_whatsapp_hwnd()
+            if hwnd:
                 # Only un-minimize WhatsApp. If it is MAXIMIZED, leave it
                 # maximized - calling SW_RESTORE on a zoomed window
                 # un-maximizes it, and WhatsApp visibly re-flows its whole
@@ -2594,6 +2628,7 @@ class WhatsAppSender:
         pyautogui = self._import_pyautogui()
         self.log(f"Opening WhatsApp Desktop for {group_name}...")
         self._open_whatsapp()
+        wa_hwnd, wa_rect = self._save_whatsapp_rect()
         self._force_focus_whatsapp()
         self.log(f"Searching group: {group_name}")
         self._type_group_search(pyautogui, group_name)
@@ -2617,6 +2652,7 @@ class WhatsAppSender:
         # Send the image (Enter confirms the image-preview dialog)
         _wa_press("enter")
         time.sleep(2.0)
+        self._restore_whatsapp_rect(wa_hwnd, wa_rect)
         self.log(f"Sent image to {group_name}")
 
     def _send_image_web(self, group_name: str, image_path: Path, text_message: str = "") -> None:
@@ -2635,6 +2671,7 @@ class WhatsAppSender:
         pyautogui = self._import_pyautogui()
         self.log(f"Opening WhatsApp Desktop for {group_name}...")
         self._open_whatsapp()
+        wa_hwnd, wa_rect = self._save_whatsapp_rect()
         self._force_focus_whatsapp()
         self.log(f"Searching group: {group_name}")
         self._type_group_search(pyautogui, group_name)
@@ -2643,6 +2680,7 @@ class WhatsAppSender:
         time.sleep(0.7)
         _wa_press("enter")
         time.sleep(1.0)
+        self._restore_whatsapp_rect(wa_hwnd, wa_rect)
         self.log(f"Sent text to {group_name}")
 
     def _send_text_web(self, group_name: str, text_message: str) -> None:
