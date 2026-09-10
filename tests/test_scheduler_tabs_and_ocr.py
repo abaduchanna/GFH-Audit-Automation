@@ -162,3 +162,34 @@ def test_b2b_scraper_strips_hardcoded_prefix():
     assert init is not None
     assert "_log_no_double_prefix" in init
     assert 'startswith("[B2B] ")' in init
+
+
+# ── 5. Round 2: blank-tab reuse, SSO company-ID stage, thread-safe OCR log ──
+
+def test_find_or_open_tab_reuses_blank_tab():
+    src = _get_source("_find_or_open_tab")
+    assert "_BLANK_TAB_URLS" in SRC and "about:blank" in SRC
+    assert "blank_handle" in src
+    # navigates the blank tab to the URL instead of window.open only
+    assert "driver.get(url)" in src
+
+
+def test_b2b_handles_sso_company_id_stage():
+    login = _get_source("login")
+    # The SSO login page shows ONLY #companyId (+ Edit/Clear/Submit) first;
+    # the flow must submit it before Username/Password can appear.
+    assert "sso_submits" in login
+    assert "SSO company-ID page — company ID submitted" in login
+    assert "sso_submits < 3" in login
+    # types the company ID into the SSO field when its value differs
+    assert 'get_attribute("value")' in login
+    # step-1 transition wait breaks early once sso.b2bsoft.com is reached
+    assert '"sso.b2bsoft.com" in (drv.current_url or "")' in login
+
+
+def test_ocr_entry_logs_on_main_thread():
+    src = _get_source("_whatsapp_ocr_entry")
+    assert "_olog" in src
+    assert "self.after(0" in src
+    # no direct widget access from the background thread
+    assert "self._log_scheduler(" not in src.replace("lambda mm=str(m): self._log_scheduler(mm)", "")
