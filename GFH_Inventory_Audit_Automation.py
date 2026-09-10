@@ -4525,7 +4525,74 @@ class B2BSoftScraper:
                             if sso_submits >= 4:
                                 sso_stuck = True
                             else:
+                                # Give the page a moment to finish loading —
+                                # attempt 1 used to fire within the same second
+                                # as the redirect, possibly before the form's
+                                # JS handlers had attached.
+                                try:
+                                    for _ in range(10):
+                                        if drv.execute_script("return document.readyState;") == "complete":
+                                            break
+                                        time.sleep(0.5)
+                                except Exception:
+                                    pass
                                 val, label = _stage_value(comp[0])
+                                # Instrument the page once per render: record
+                                # submit events + fetch/XHR so a failed attempt
+                                # shows whether the form actually posted, and
+                                # log the form's action/method/button binding.
+                                try:
+                                    _sso_info = drv.execute_script("""
+                                        if (window.__b2bNetInstalled) return {already: true};
+                                        window.__b2bNetInstalled = true;
+                                        window.__b2bNet = [];
+                                        window.addEventListener('submit', function(e) {
+                                            window.__b2bNet.push('submit-event -> ' + ((e.target && e.target.action) || 'no-action'));
+                                        }, true);
+                                        var _fs = HTMLFormElement.prototype.submit;
+                                        HTMLFormElement.prototype.submit = function() {
+                                            window.__b2bNet.push('form.submit() -> ' + (this.action || 'no-action'));
+                                            return _fs.apply(this, arguments);
+                                        };
+                                        if (window.fetch) {
+                                            var _f = window.fetch;
+                                            window.fetch = function() {
+                                                try { window.__b2bNet.push('fetch -> ' + (arguments[0] && (arguments[0].url || arguments[0]))); } catch (e) {}
+                                                return _f.apply(this, arguments);
+                                            };
+                                        }
+                                        var _xo = XMLHttpRequest.prototype.open;
+                                        XMLHttpRequest.prototype.open = function(m, u) {
+                                            try { window.__b2bNet.push('xhr -> ' + m + ' ' + u); } catch (e) {}
+                                            return _xo.apply(this, arguments);
+                                        };
+                                        var el = document.querySelector('#companyId');
+                                        var btn = document.querySelector('#btnSubmit');
+                                        var form = el ? el.form : null;
+                                        return {
+                                            installed: true,
+                                            formAction: form ? String(form.action || '') : null,
+                                            formMethod: form ? String(form.method || '') : null,
+                                            btnInForm: !!(btn && form && btn.form === form),
+                                            btnDisabled: !!(btn && (btn.disabled || btn.getAttribute('aria-disabled') === 'true')),
+                                            inputs: Array.prototype.map.call(
+                                                document.querySelectorAll('input'),
+                                                function(i) {
+                                                    return (i.id ? '#' + i.id : (i.name ? '[name=' + i.name + ']' : 'input'))
+                                                        + (i.type && i.type !== 'text' ? '[' + i.type + ']' : '')
+                                                        + (i.required ? '[required]' : '');
+                                                }).slice(0, 12)
+                                        };
+                                    """) or {}
+                                    if _sso_info.get("installed"):
+                                        self.log(
+                                            "SSO page form: action=" + str(_sso_info.get("formAction"))
+                                            + ", method=" + str(_sso_info.get("formMethod"))
+                                            + ", #btnSubmit inside form: " + ("yes" if _sso_info.get("btnInForm") else "NO")
+                                            + (", #btnSubmit DISABLED" if _sso_info.get("btnDisabled") else "")
+                                            + ", inputs: " + ", ".join(_sso_info.get("inputs") or []))
+                                except Exception:
+                                    _sso_info = {}
                                 # Read-only/disabled field? The Edit button
                                 # exists to unlock it — click it first.
                                 try:
@@ -4552,6 +4619,30 @@ class B2BSoftScraper:
                                         self.log(f"SSO {label} typed: '{got}'.")
                                 else:
                                     self.log(f"SSO {label} field already holds '{cur_val}'.")
+                                    # Value was pre-filled by the server — the
+                                    # page's JS may still be waiting for
+                                    # input/change events before it accepts the
+                                    # form. Fire them (harmless when unneeded).
+                                    try:
+                                        drv.execute_script(
+                                            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                                            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                                            comp[0])
+                                    except Exception:
+                                        pass
+                                # A previous failed submit can leave the Continue
+                                # button disabled (double-submit guard) — a
+                                # disabled button swallows every click.
+                                try:
+                                    if drv.execute_script(
+                                            "var b = document.querySelector('#btnSubmit');"
+                                            "if (b && (b.disabled || b.getAttribute('aria-disabled') === 'true')) {"
+                                            "  b.disabled = false; b.removeAttribute('aria-disabled');"
+                                            "  return true;"
+                                            "} return false;"):
+                                        self.log("SSO #btnSubmit was disabled — force-enabled it before submitting.")
+                                except Exception:
+                                    pass
                                 # The real page marks the field required="True" —
                                 # an EMPTY value makes the browser silently block
                                 # every submit with "Please fill out this field".
@@ -4576,14 +4667,14 @@ class B2BSoftScraper:
                                 except Exception:
                                     submit_val = val
                                 sso_submits += 1
-                                strategy = ("submit", "enter", "edit", "submit")[sso_submits - 1]
-                                if strategy == "edit" and not drv.find_elements(By.ID, "btnCompanyIdEdit"):
-                                    # The real SSO page has only #companyId +
-                                    # #btnSubmit ("Continue") — no Edit button.
-                                    # Don't burn the attempt: submit through the
-                                    # form itself (requestSubmit keeps the
-                                    # button=continue entry and native validation).
-                                    strategy = "rsubmit"
+                                # Rotation: real click → ENTER → requestSubmit
+                                # (keeps button=continue + native validation) →
+                                # raw form.submit() (bypasses any broken JS
+                                # submit handler). Edit is NOT a strategy: this
+                                # page's #btnCompanyIdEdit only focuses the
+                                # field — the readonly pre-step above already
+                                # clicks it when the field is genuinely locked.
+                                strategy = ("submit", "enter", "rsubmit", "formsubmit")[sso_submits - 1]
                                 if strategy == "enter":
                                     from selenium.webdriver.common.keys import Keys as _Keys
                                     comp[0].send_keys(_Keys.RETURN)
@@ -4600,10 +4691,31 @@ class B2BSoftScraper:
                                         self.log(f"SSO Access Code page — {label} submitted via form {how} (attempt {sso_submits}, field='{submit_val}').")
                                     except Exception as e:
                                         self.log(f"SSO Access Code page — form submit failed: {e}")
+                                elif strategy == "formsubmit":
+                                    try:
+                                        how = drv.execute_script(
+                                            "var el = document.querySelector('#companyId');"
+                                            "var form = el ? el.form : null;"
+                                            "if (!form) {"
+                                            "  var btn = document.querySelector('#btnSubmit');"
+                                            "  form = btn ? btn.form : null;"
+                                            "}"
+                                            "if (!form) {"
+                                            "  var fs = document.querySelectorAll('form');"
+                                            "  for (var i = 0; i < fs.length; i++) {"
+                                            "    if (fs[i].querySelector('#companyId')) { form = fs[i]; break; }"
+                                            "  }"
+                                            "}"
+                                            "if (!form) return 'noform';"
+                                            "form.submit();"
+                                            "return 'posted -> ' + String(form.action || '').slice(-60);")
+                                        self.log(f"SSO Access Code page — raw form.submit() sent (attempt {sso_submits}, field='{submit_val}', {how}).")
+                                    except Exception as e:
+                                        self.log(f"SSO Access Code page — raw form.submit() failed: {e}")
                                 else:
-                                    btn_id = "btnSubmit" if strategy == "submit" else "btnCompanyIdEdit"
+                                    btn_id = "btnSubmit"
                                     btns = drv.find_elements(By.ID, btn_id)
-                                    if not btns and strategy == "submit":
+                                    if not btns:
                                         # Real button text is "Continue" —
                                         # fall back to a text match.
                                         try:
@@ -4617,21 +4729,6 @@ class B2BSoftScraper:
                                     if btns:
                                         _js_click(btns[0])
                                         self.log(f"SSO Access Code page — {label} submitted via #{btn_id} (attempt {sso_submits}, field='{submit_val}').")
-                                        if strategy == "edit":
-                                            # Edit may only unlock the field —
-                                            # re-type, then submit for real.
-                                            time.sleep(0.8)
-                                            try:
-                                                c3 = drv.find_elements(By.ID, "companyId")
-                                                if c3 and (c3[0].get_attribute("value") or "").strip() != val:
-                                                    got2 = _type_and_verify(c3[0], val)
-                                                    self.log(f"SSO {label} re-typed after Edit: '{got2}'.")
-                                                    sub2 = drv.find_elements(By.ID, "btnSubmit")
-                                                    if sub2:
-                                                        _js_click(sub2[0])
-                                                        self.log(f"SSO Access Code page — {label} submitted via #btnSubmit after Edit (attempt {sso_submits}).")
-                                            except Exception:
-                                                pass
                                     else:
                                         self.log(f"SSO Access Code page — #{btn_id} not on page (attempt {sso_submits} skipped).")
                                 # Give the SSO page up to 8s to advance before
@@ -4660,9 +4757,12 @@ class B2BSoftScraper:
                                                 validation: el ? el.validationMessage : null
                                             };
                                             out.errors = Array.from(document.querySelectorAll(
-                                                '.validation-summary-errors, .field-validation-error, .error, .alert-danger'
+                                                '.validation-summary-errors, .field-validation-error, .error, .alert-danger, .text-danger, [class*="error" i]'
                                             )).map(e => (e.innerText || '').trim())
                                               .filter(t => t).slice(0, 3);
+                                            out.body = (document.body && document.body.innerText
+                                                ? document.body.innerText : '')
+                                                .replace(/\\s+/g, ' ').trim().slice(0, 220);
                                             return out;
                                         """)
                                         err_txt = "; ".join(why.get("errors") or [])
@@ -4675,6 +4775,18 @@ class B2BSoftScraper:
                                             f"(URL: {url_now}) — field now '{why.get('value')}', "
                                             f"validation: '{why.get('validation') or 'none'}'"
                                             + (f", page error: {err_txt}" if err_txt else ""))
+                                        try:
+                                            _net = drv.execute_script(
+                                                "return (window.__b2bNet || []).splice(0, 20);") or []
+                                        except Exception:
+                                            _net = []
+                                        if _net:
+                                            self.log("SSO page submit/network activity: " + " | ".join(str(x) for x in _net))
+                                        else:
+                                            self.log("SSO page submit/network activity: NONE — the submit never reached the form.")
+                                        _body_txt = str(why.get("body") or "")
+                                        if _body_txt:
+                                            self.log(f"SSO page text: {_body_txt}")
                                         _vmsg = (why.get("validation") or "").lower()
                                         if "fill out" in _vmsg or "required" in _vmsg:
                                             self.log(
@@ -4700,7 +4812,7 @@ class B2BSoftScraper:
                     _fields = _visible_fields_snapshot()
                     raise RuntimeError(
                         "B2B login stalled on the SSO 'Access Code' page — tried 4 times "
-                        "(Submit → Enter → requestSubmit → Submit) without the page advancing. "
+                        "(Submit → Enter → requestSubmit → form.submit) without the page advancing. "
                         "The log lines above show the exact field value at every submit "
                         "attempt plus any page error text. Verify the Company ID on the "
                         "Portal Credentials tab (it doubles as the Access Code) and retry. "
