@@ -4130,7 +4130,10 @@ class B2BSoftScraper:
     """Selenium scraper for the B2B Soft inventory portal.
 
     Login flow:
-        Step 1 → Enter Company ID (#companyId) → click #btnSubmit
+        Step 1 → Enter Access Code or Company ID (#companyId) → click #btnSubmit
+                 (the SSO login page labels #companyId "Access Code" and
+                 rejects the numeric Company ID — save the Access Code on the
+                 app's Portal Credentials tab)
         Step 2 → Enter Account ID (#AccountId)
         Step 3 → Enter Username (#Username) + Password (#Password) → click #btnClick
 
@@ -4142,8 +4145,12 @@ class B2BSoftScraper:
 
     def __init__(self, company_id: str, account_id: str,
                  username: str, password: str,
-                 download_dir: Path, log_fn=None):
+                 download_dir: Path, log_fn=None, access_code: str = ""):
         self.company_id = company_id
+        # Access Code — the SSO login page (sso.b2bsoft.com/account/login)
+        # labels its #companyId field "Access Code" and rejects the plain
+        # numeric Company ID. Saved on the Portal Credentials tab.
+        self.access_code = (access_code or "").strip()
         self.account_id = account_id
         self.username = username
         self.password = password
@@ -4314,13 +4321,38 @@ class B2BSoftScraper:
             raise RuntimeError(f"B2B field #{field_id} ({label}) not visible after {timeout}s.")
 
         # ── Step 1: Company ID ─────────────────────────────────────────────
+        # The #companyId input is dual-purpose: on the wsreports landing page
+        # it asks for the Company ID, while the SSO login page
+        # (sso.b2bsoft.com/account/login) labels the very same field
+        # "Access Code" (placeholder) and REJECTS the plain Company ID.
+        # Pick the value from the field's placeholder, falling back to the
+        # current URL when the placeholder is missing.
+        def _stage_value(el):
+            try:
+                ph = (el.get_attribute("placeholder") or "").strip().lower()
+            except Exception:
+                ph = ""
+            want_access = "access code" in ph
+            if not ph:
+                try:
+                    want_access = "sso.b2bsoft.com" in (drv.current_url or "")
+                except Exception:
+                    want_access = False
+            if want_access:
+                if (self.access_code or "").strip():
+                    return self.access_code.strip(), "Access Code"
+                self.log("Access Code field detected but no Access Code saved on the "
+                         "Portal Credentials tab — falling back to Company ID.")
+            return (self.company_id or "").strip(), "Company ID"
+
         try:
             f = wait.until(EC.visibility_of_element_located((By.ID, "companyId")))
-            _robust_type(f, self.company_id)
-            self.log(f"Company ID entered: {self.company_id}")
+            val, label = _stage_value(f)
+            _robust_type(f, val)
+            self.log(f"{label} entered: {val}")
             btn = wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit")))
             _js_click(btn)
-            self.log("Company ID submitted.")
+            self.log(f"{label} submitted.")
             # Wait for the companyId field to go hidden (page transition started)
             # before polling for AccountId — prevents burning 150s on the wrong page.
             # Landing on sso.b2bsoft.com counts as transitioned — its Step-2
@@ -4382,27 +4414,54 @@ class B2BSoftScraper:
                     except Exception:
                         pass
                 # SSO company-ID stage: the login page shows ONLY #companyId
-                # (+ Edit/Clear/Next buttons) — type the company ID and click
-                # Next so the Account/Username/Password fields appear.
+                # (placeholder "Access Code") + Edit/Clear/Submit buttons —
+                # type the Access Code and submit so the Account/Username/
+                # Password fields appear. After 3 rejected submits, fail fast
+                # with an actionable message instead of idling to the 150s
+                # deadline (the endless "Waiting for Account ID" spam).
                 comp = drv.find_elements(By.ID, "companyId")
-                if comp and sso_submits < 3:
+                sso_stuck = False
+                if comp:
                     try:
                         if comp[0].is_displayed():
-                            try:
-                                cur_val = (comp[0].get_attribute("value") or "").strip()
-                            except Exception:
-                                cur_val = ""
-                            if cur_val != (self.company_id or "").strip():
-                                _robust_type(comp[0], self.company_id)
-                            btns = drv.find_elements(By.ID, "btnSubmit")
-                            if btns:
-                                _js_click(btns[0])
-                                sso_submits += 1
-                                self.log(f"SSO company-ID page — company ID submitted (attempt {sso_submits}).")
-                                time.sleep(2)
-                                continue
+                            if sso_submits >= 3:
+                                sso_stuck = True
+                            else:
+                                val, label = _stage_value(comp[0])
+                                try:
+                                    cur_val = (comp[0].get_attribute("value") or "").strip()
+                                except Exception:
+                                    cur_val = ""
+                                if cur_val != val:
+                                    _robust_type(comp[0], val)
+                                btns = drv.find_elements(By.ID, "btnSubmit")
+                                if btns:
+                                    _js_click(btns[0])
+                                    sso_submits += 1
+                                    self.log(f"SSO Access Code page — {label} submitted (attempt {sso_submits}).")
+                                    # Give the SSO page up to 8s to advance before
+                                    # counting the next attempt — avoids double-
+                                    # submitting a value the server is still processing.
+                                    for _ in range(16):
+                                        time.sleep(0.5)
+                                        try:
+                                            c2 = drv.find_elements(By.ID, "companyId")
+                                            if not c2 or not c2[0].is_displayed():
+                                                break
+                                        except Exception:
+                                            break
+                                    continue
                     except Exception:
                         pass
+                if sso_stuck:
+                    _fields = _visible_fields_snapshot()
+                    raise RuntimeError(
+                        "B2B login stalled on the SSO 'Access Code' page — submitted 3 times "
+                        "without the page advancing. Open the Portal Credentials tab, verify the "
+                        "Access Code value (the SSO company field is labelled 'Access Code'), "
+                        "save, and retry. "
+                        + ("Visible fields: " + ", ".join(_fields) if _fields else "No visible fields on page.")
+                    )
                 now = time.time()
                 if now - last_diag >= 15:
                     elapsed = int(now - (deadline - 150))
@@ -4427,6 +4486,8 @@ class B2BSoftScraper:
                 fields = _visible_fields_snapshot()
                 raise RuntimeError(
                     "B2B Account ID step failed: neither AccountId nor Username appeared within 150s. "
+                    "If the page shows an 'Access Code' field, verify the Access Code on the "
+                    "Portal Credentials tab. "
                     + ("Visible fields: " + ", ".join(fields) if fields else "No visible input fields on page.")
                 )
         except RuntimeError:
@@ -5002,6 +5063,7 @@ class GFHApp(tk.Tk):
 
         # ── Portal Credentials (stored in the existing SQLite DB) ───────────
         self.brs_company_id_var = tk.StringVar(value="9909129")
+        self.brs_access_code_var = tk.StringVar(value="")
         self.brs_account_id_var = tk.StringVar(value="")
         self.brs_username_var = tk.StringVar(value="")
         self.brs_password_var = tk.StringVar(value="")
@@ -5386,6 +5448,7 @@ class GFHApp(tk.Tk):
         brs_box.pack(fill="x", pady=(0, 10))
         fields_brs = [
             ("Company ID",  self.brs_company_id_var, False),
+            ("Access Code", self.brs_access_code_var, False),
             ("Account ID",  self.brs_account_id_var, False),
             ("Username",    self.brs_username_var,   False),
             ("Password",    self.brs_password_var,   True),
@@ -5425,6 +5488,7 @@ class GFHApp(tk.Tk):
         data = {
             "brs": {
                 "company_id": self.brs_company_id_var.get().strip(),
+                "access_code": self.brs_access_code_var.get().strip(),
                 "account_id": self.brs_account_id_var.get().strip(),
                 "username":   self.brs_username_var.get().strip(),
                 "password":   self.brs_password_var.get(),
@@ -5445,6 +5509,7 @@ class GFHApp(tk.Tk):
             data = self.db.load_portal_credentials()
             brs = data.get("brs", {})
             self.brs_company_id_var.set(brs.get("company_id", "9909129") or "9909129")
+            self.brs_access_code_var.set(brs.get("access_code", "") or "")
             self.brs_account_id_var.set(brs.get("account_id", "") or "")
             self.brs_username_var.set(brs.get("username", "") or "")
             self.brs_password_var.set(brs.get("password", "") or "")
@@ -5458,6 +5523,7 @@ class GFHApp(tk.Tk):
         self._save_credentials()
         scraper = B2BSoftScraper(
             company_id=self.brs_company_id_var.get().strip(),
+            access_code=self.brs_access_code_var.get().strip(),
             account_id=self.brs_account_id_var.get().strip(),
             username=self.brs_username_var.get().strip(),
             password=self.brs_password_var.get(),
@@ -5646,7 +5712,7 @@ class GFHApp(tk.Tk):
                 _log("✓ Edge ready at port 9227.")
                 names = self._sched_open_tabs()
                 if names:
-                    _log("Opened " + _humanize_list(names) + " tabs.")
+                    self.after(0, lambda n=list(names): self._log_tabs_opened(n))
             else:
                 _log("⚠ Could not open Edge at port 9227.")
             self._scheduler_run_export_cycle()
@@ -5708,6 +5774,17 @@ class GFHApp(tk.Tk):
             include_wa = True
         return open_monitoring_tabs(include_whatsapp=include_wa)
 
+    def _log_tabs_opened(self, names: list) -> None:
+        """Log 'Opened X, Y tabs.' — suppresses exact repeats within 90s so the
+        scheduler-startup open and the first export cycle don't double-log."""
+        msg = "Opened " + _humanize_list(list(names)) + " tabs."
+        now = time.monotonic()
+        last_msg, last_t = getattr(self, "_last_tabs_log", (None, 0.0))
+        if msg == last_msg and (now - last_t) < 90:
+            return
+        self._last_tabs_log = (msg, now)
+        self._log_scheduler(msg)
+
     def _scheduler_run_export_cycle(self, district: str = None) -> None:
         """Export B2B + Timesheet files, reload variances, optionally send variance image."""
         lock = getattr(self, "_export_cycle_lock", None)
@@ -5721,14 +5798,14 @@ class GFHApp(tk.Tk):
             try:
                 names = self._sched_open_tabs()
                 if names:
-                    self.after(0, lambda n=list(names): self._log_scheduler(
-                        "Opened " + _humanize_list(n) + " tabs."))
+                    self.after(0, lambda n=list(names): self._log_tabs_opened(n))
             except Exception:
                 pass
 
             # Build both scrapers upfront — init tab handles sequentially before scraping.
             brs = B2BSoftScraper(
                 company_id=self.brs_company_id_var.get().strip(),
+                access_code=self.brs_access_code_var.get().strip(),
                 account_id=self.brs_account_id_var.get().strip(),
                 username=self.brs_username_var.get().strip(),
                 password=self.brs_password_var.get(),
