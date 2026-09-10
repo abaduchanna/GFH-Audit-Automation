@@ -4507,13 +4507,16 @@ class B2BSoftScraper:
                             break
                     except Exception:
                         pass
-                # SSO company-ID stage: the login page shows ONLY #companyId
-                # (placeholder "Access Code") + Edit/Clear/Submit buttons —
-                # the Company ID doubles as the Access Code. Every attempt
-                # LOGS the typed value (silent typing hid a visually-empty
-                # field), unlocks a read-only field via #btnCompanyIdEdit,
-                # and after a failed advance reads the page's validation and
-                # error text so a server rejection is named in the log.
+                # SSO company-ID stage (user-supplied HTML): the page shows
+                # ONLY #companyId (placeholder "Access Code", required="True")
+                # + #btnSubmit ("Continue") — the Company ID doubles as the
+                # Access Code. Every attempt LOGS the typed value (silent
+                # typing hid a visually-empty field), re-forces the DOM value
+                # right before submit (required + empty field = the browser
+                # silently blocks the submit), unlocks a read-only field via
+                # #btnCompanyIdEdit when one exists, and after a failed
+                # advance reads the page's validation and error text so a
+                # server rejection is named in the log.
                 comp = drv.find_elements(By.ID, "companyId")
                 sso_stuck = False
                 if comp:
@@ -4549,18 +4552,71 @@ class B2BSoftScraper:
                                         self.log(f"SSO {label} typed: '{got}'.")
                                 else:
                                     self.log(f"SSO {label} field already holds '{cur_val}'.")
+                                # The real page marks the field required="True" —
+                                # an EMPTY value makes the browser silently block
+                                # every submit with "Please fill out this field".
+                                # Re-check the DOM value at the last moment and
+                                # force it in via JS so the POST carries the code.
+                                try:
+                                    pre_val = (comp[0].get_attribute("value") or "").strip()
+                                except Exception:
+                                    pre_val = val
+                                if pre_val != val:
+                                    try:
+                                        drv.execute_script(
+                                            "arguments[0].value = arguments[1];"
+                                            "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                                            "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                                            comp[0], val)
+                                        self.log(f"SSO {label} value re-forced via JS before submit ('{val}').")
+                                    except Exception:
+                                        pass
+                                try:
+                                    submit_val = (comp[0].get_attribute("value") or "").strip()
+                                except Exception:
+                                    submit_val = val
                                 sso_submits += 1
                                 strategy = ("submit", "enter", "edit", "submit")[sso_submits - 1]
+                                if strategy == "edit" and not drv.find_elements(By.ID, "btnCompanyIdEdit"):
+                                    # The real SSO page has only #companyId +
+                                    # #btnSubmit ("Continue") — no Edit button.
+                                    # Don't burn the attempt: submit through the
+                                    # form itself (requestSubmit keeps the
+                                    # button=continue entry and native validation).
+                                    strategy = "rsubmit"
                                 if strategy == "enter":
                                     from selenium.webdriver.common.keys import Keys as _Keys
                                     comp[0].send_keys(_Keys.RETURN)
-                                    self.log(f"SSO Access Code page — ENTER sent on {label} field (attempt {sso_submits}, field='{cur_val}').")
+                                    self.log(f"SSO Access Code page — ENTER sent on {label} field (attempt {sso_submits}, field='{submit_val}').")
+                                elif strategy == "rsubmit":
+                                    try:
+                                        how = drv.execute_script(
+                                            "const el = document.querySelector('#companyId');"
+                                            "const btn = document.querySelector('#btnSubmit');"
+                                            "const form = (el && el.form) || (btn && btn.form);"
+                                            "if (!form) return 'noform';"
+                                            "if (form.requestSubmit) { form.requestSubmit(btn || undefined); return 'requestSubmit'; }"
+                                            "form.submit(); return 'form.submit';")
+                                        self.log(f"SSO Access Code page — {label} submitted via form {how} (attempt {sso_submits}, field='{submit_val}').")
+                                    except Exception as e:
+                                        self.log(f"SSO Access Code page — form submit failed: {e}")
                                 else:
                                     btn_id = "btnSubmit" if strategy == "submit" else "btnCompanyIdEdit"
                                     btns = drv.find_elements(By.ID, btn_id)
+                                    if not btns and strategy == "submit":
+                                        # Real button text is "Continue" —
+                                        # fall back to a text match.
+                                        try:
+                                            btns = [b for b in drv.find_elements(By.TAG_NAME, "button")
+                                                    if (b.text or "").strip().lower() == "continue"
+                                                    and b.is_displayed()]
+                                            if btns:
+                                                btn_id = "button:Continue"
+                                        except Exception:
+                                            btns = []
                                     if btns:
                                         _js_click(btns[0])
-                                        self.log(f"SSO Access Code page — {label} submitted via #{btn_id} (attempt {sso_submits}, field='{cur_val}').")
+                                        self.log(f"SSO Access Code page — {label} submitted via #{btn_id} (attempt {sso_submits}, field='{submit_val}').")
                                         if strategy == "edit":
                                             # Edit may only unlock the field —
                                             # re-type, then submit for real.
@@ -4619,6 +4675,11 @@ class B2BSoftScraper:
                                             f"(URL: {url_now}) — field now '{why.get('value')}', "
                                             f"validation: '{why.get('validation') or 'none'}'"
                                             + (f", page error: {err_txt}" if err_txt else ""))
+                                        _vmsg = (why.get("validation") or "").lower()
+                                        if "fill out" in _vmsg or "required" in _vmsg:
+                                            self.log(
+                                                "⚠ The browser blocked the submit — #companyId was EMPTY "
+                                                "at submit time (the Access Code did not stick in the DOM).")
                                         if err_txt and any(k in err_txt.lower() for k in (
                                                 "invalid", "incorrect", "wrong", "not found",
                                                 "failed", "expire", "locked", "unable")):
@@ -4639,7 +4700,7 @@ class B2BSoftScraper:
                     _fields = _visible_fields_snapshot()
                     raise RuntimeError(
                         "B2B login stalled on the SSO 'Access Code' page — tried 4 times "
-                        "(Submit → Enter → Edit → Submit) without the page advancing. "
+                        "(Submit → Enter → requestSubmit → Submit) without the page advancing. "
                         "The log lines above show the exact field value at every submit "
                         "attempt plus any page error text. Verify the Company ID on the "
                         "Portal Credentials tab (it doubles as the Access Code) and retry. "
