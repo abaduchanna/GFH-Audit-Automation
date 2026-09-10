@@ -3697,10 +3697,18 @@ def _b2b_complete_setup_next_flow(driver, stop_event=None, log=print,
         if state == _B2B_STATE_TRUST_DEVICE:
             if not _b2b_select_trust_radio(driver, stop_event=stop_event, log=log):
                 return False
+            # VidaPay click_trust_device_next: primary attempt matches
+            # onclick submitthisform, fallback matches #setupNextBtn by id.
             if not _b2b_click_button(driver, label="Trust Device Next",
-                                     text_contains="next", button_id="setupNextBtn",
+                                     text_contains="next",
+                                     onclick_contains="submitthisform",
+                                     button_id="setupNextBtn",
                                      timeout=30, log=log):
-                return False
+                if not _b2b_click_button(driver, label="Trust Device Next fallback",
+                                         text_contains="next",
+                                         button_id="setupNextBtn",
+                                         timeout=30, log=log):
+                    return False
             steps_done += 1
             time.sleep(1)
             continue
@@ -3759,9 +3767,10 @@ def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 30
     complete_remaining_setup_next_flow chain.
 
     Handles (everything AFTER the access code / credentials steps):
-      - New Sign In (unrecognized device) → click Next
-      - 2FA / OTP verification → wait for user approval
-      - Trust Device radio → #setupNextBtn walk → Ready To Go → portal
+      - New Sign In (<h3>New Sign In</h3>) → click Next (onclick goToTwoFactorCheck)
+      - 2FA page → wait for the Trust Device radio (#trustRadio), select it,
+        click its Next (#setupNextBtn / onclick submitthisform)
+      - Trust Device → #setupNextBtn walk → Ready To Go → portal
       - Security Upgrade page → wait it out (never click its Next)
       - Cloudflare re-verification → wait to clear
       - Portal/alert popups → dismiss 'Later' alerts → done
@@ -3794,18 +3803,48 @@ def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 30
             continue
 
         if state == _B2B_STATE_NEW_SIGN:
-            if steps == 0:
+            # Faithful port of VidaPay click_new_sign_in_next. The real page
+            # shows <h3>New Sign In</h3> with
+            # <button onclick="goToTwoFactorCheck()">Next</button>. Selenium
+            # clickability waits miss it (SPA renders the button
+            # non-interactive first), so match text+onclick and click via the
+            # force-enabling JS path. Retry every pass — a silently failed
+            # click must not strand the flow on this page.
+            clicked = _b2b_click_button(
+                driver, label="New Sign In Next",
+                text_contains="next", onclick_contains="gototwofactorcheck",
+                timeout=30, log=log)
+            if not clicked:
+                clicked = _b2b_click_button(
+                    driver, label="New Sign In Next fallback",
+                    text_contains="next", timeout=10, log=log)
+            if not clicked:
                 _b2b_click_any_next(driver, log=log)
-                steps += 1
-            time.sleep(2)
+            steps += 1
+            time.sleep(1)
             continue
 
         if state == _B2B_STATE_TWO_FA:
-            now = time.time()
-            if now - last_log >= 15:
-                log("B2B 2FA required — approve the push notification or enter OTP to continue…")
-                last_log = now
-            time.sleep(2)
+            # 2FA page: once the code is sent/approved, the Trust Device
+            # radio (#trustRadio) appears on this page. Port of VidaPay
+            # select_trust_radio_quickly — select it the moment it exists in
+            # the DOM, then submit via its Next (#setupNextBtn / onclick
+            # submitthisform). User flow: read New Sign In → click Next →
+            # continue with the 2FA radio.
+            log("[B2B] 2FA page — waiting for the Trust Device radio and selecting it automatically…")
+            if not _b2b_select_trust_radio(driver, stop_event=stop_event, log=log):
+                return False
+            if _b2b_get_page_state(driver) == _B2B_STATE_TWO_FA:
+                # Radio was checked on the 2FA page itself — click its Next.
+                if not _b2b_click_button(
+                        driver, label="2FA radio Next",
+                        text_contains="next", onclick_contains="submitthisform",
+                        button_id="setupNextBtn", timeout=30, log=log):
+                    _b2b_click_button(
+                        driver, label="2FA radio Next fallback",
+                        text_contains="next", button_id="setupNextBtn",
+                        timeout=10, log=log)
+            last_state = None
             continue
 
         if state in (_B2B_STATE_TRUST_DEVICE, _B2B_STATE_SETUP_NEXT,
