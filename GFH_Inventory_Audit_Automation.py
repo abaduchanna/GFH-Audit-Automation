@@ -4509,13 +4509,11 @@ class B2BSoftScraper:
                         pass
                 # SSO company-ID stage: the login page shows ONLY #companyId
                 # (placeholder "Access Code") + Edit/Clear/Submit buttons —
-                # the Company ID doubles as the Access Code. Type it, then
-                # rotate the submit strategy (Submit → Enter → Edit → Submit)
-                # because the SSO page can ignore #btnSubmit when the field
-                # is disabled or the button belongs to another form. After 4
-                # failed attempts, fail fast with an actionable message
-                # instead of idling to the 150s deadline (the endless
-                # "Waiting for Account ID" spam).
+                # the Company ID doubles as the Access Code. Every attempt
+                # LOGS the typed value (silent typing hid a visually-empty
+                # field), unlocks a read-only field via #btnCompanyIdEdit,
+                # and after a failed advance reads the page's validation and
+                # error text so a server rejection is named in the log.
                 comp = drv.find_elements(By.ID, "companyId")
                 sso_stuck = False
                 if comp:
@@ -4525,6 +4523,20 @@ class B2BSoftScraper:
                                 sso_stuck = True
                             else:
                                 val, label = _stage_value(comp[0])
+                                # Read-only/disabled field? The Edit button
+                                # exists to unlock it — click it first.
+                                try:
+                                    ro = drv.execute_script(
+                                        "const el = document.querySelector('#companyId');"
+                                        "return !!(el && (el.readOnly || el.disabled));")
+                                except Exception:
+                                    ro = False
+                                if ro:
+                                    edit_btns = drv.find_elements(By.ID, "btnCompanyIdEdit")
+                                    if edit_btns:
+                                        _js_click(edit_btns[0])
+                                        self.log("SSO Access Code field is read-only — clicked #btnCompanyIdEdit to unlock it.")
+                                        time.sleep(0.8)
                                 try:
                                     cur_val = (comp[0].get_attribute("value") or "").strip()
                                 except Exception:
@@ -4533,32 +4545,94 @@ class B2BSoftScraper:
                                     got = _type_and_verify(comp[0], val)
                                     if got != val:
                                         self.log(f"⚠ SSO {label} field did not accept typing (value now '{got}') — attempting submit anyway.")
+                                    else:
+                                        self.log(f"SSO {label} typed: '{got}'.")
+                                else:
+                                    self.log(f"SSO {label} field already holds '{cur_val}'.")
                                 sso_submits += 1
                                 strategy = ("submit", "enter", "edit", "submit")[sso_submits - 1]
                                 if strategy == "enter":
                                     from selenium.webdriver.common.keys import Keys as _Keys
                                     comp[0].send_keys(_Keys.RETURN)
-                                    self.log(f"SSO Access Code page — ENTER sent on {label} field (attempt {sso_submits}).")
+                                    self.log(f"SSO Access Code page — ENTER sent on {label} field (attempt {sso_submits}, field='{cur_val}').")
                                 else:
                                     btn_id = "btnSubmit" if strategy == "submit" else "btnCompanyIdEdit"
                                     btns = drv.find_elements(By.ID, btn_id)
                                     if btns:
                                         _js_click(btns[0])
-                                        self.log(f"SSO Access Code page — {label} submitted via #{btn_id} (attempt {sso_submits}).")
+                                        self.log(f"SSO Access Code page — {label} submitted via #{btn_id} (attempt {sso_submits}, field='{cur_val}').")
+                                        if strategy == "edit":
+                                            # Edit may only unlock the field —
+                                            # re-type, then submit for real.
+                                            time.sleep(0.8)
+                                            try:
+                                                c3 = drv.find_elements(By.ID, "companyId")
+                                                if c3 and (c3[0].get_attribute("value") or "").strip() != val:
+                                                    got2 = _type_and_verify(c3[0], val)
+                                                    self.log(f"SSO {label} re-typed after Edit: '{got2}'.")
+                                                    sub2 = drv.find_elements(By.ID, "btnSubmit")
+                                                    if sub2:
+                                                        _js_click(sub2[0])
+                                                        self.log(f"SSO Access Code page — {label} submitted via #btnSubmit after Edit (attempt {sso_submits}).")
+                                            except Exception:
+                                                pass
                                     else:
                                         self.log(f"SSO Access Code page — #{btn_id} not on page (attempt {sso_submits} skipped).")
                                 # Give the SSO page up to 8s to advance before
                                 # the next attempt — avoids double-submitting
                                 # a value the server is still processing.
+                                advanced = False
                                 for _ in range(16):
                                     time.sleep(0.5)
                                     try:
                                         c2 = drv.find_elements(By.ID, "companyId")
                                         if not c2 or not c2[0].is_displayed():
+                                            advanced = True
                                             break
                                     except Exception:
                                         break
+                                if not advanced:
+                                    # Page did not move — log WHY: field value
+                                    # now, HTML5 validation message, visible
+                                    # error text, current URL. Fail fast when
+                                    # the server actually rejected the code.
+                                    try:
+                                        why = drv.execute_script("""
+                                            const el = document.querySelector('#companyId');
+                                            const out = {
+                                                value: el ? el.value : null,
+                                                validation: el ? el.validationMessage : null
+                                            };
+                                            out.errors = Array.from(document.querySelectorAll(
+                                                '.validation-summary-errors, .field-validation-error, .error, .alert-danger'
+                                            )).map(e => (e.innerText || '').trim())
+                                              .filter(t => t).slice(0, 3);
+                                            return out;
+                                        """)
+                                        err_txt = "; ".join(why.get("errors") or [])
+                                        try:
+                                            url_now = drv.current_url
+                                        except Exception:
+                                            url_now = "unknown"
+                                        self.log(
+                                            f"SSO page did not advance after attempt {sso_submits} "
+                                            f"(URL: {url_now}) — field now '{why.get('value')}', "
+                                            f"validation: '{why.get('validation') or 'none'}'"
+                                            + (f", page error: {err_txt}" if err_txt else ""))
+                                        if err_txt and any(k in err_txt.lower() for k in (
+                                                "invalid", "incorrect", "wrong", "not found",
+                                                "failed", "expire", "locked", "unable")):
+                                            raise RuntimeError(
+                                                f"B2B SSO rejected the Access Code: {err_txt} — "
+                                                "verify the Company ID on the Portal Credentials tab "
+                                                "(it doubles as the Access Code) and retry.")
+                                    except RuntimeError:
+                                        raise
+                                    except Exception:
+                                        pass
                                 continue
+                    except RuntimeError:
+                        raise
                     except Exception:
                         pass
                 if sso_stuck:
@@ -4566,8 +4640,9 @@ class B2BSoftScraper:
                     raise RuntimeError(
                         "B2B login stalled on the SSO 'Access Code' page — tried 4 times "
                         "(Submit → Enter → Edit → Submit) without the page advancing. "
-                        "Verify the Company ID on the Portal Credentials tab (it doubles "
-                        "as the Access Code) and retry. "
+                        "The log lines above show the exact field value at every submit "
+                        "attempt plus any page error text. Verify the Company ID on the "
+                        "Portal Credentials tab (it doubles as the Access Code) and retry. "
                         + ("Visible fields: " + ", ".join(_fields) if _fields else "No visible fields on page.")
                     )
                 now = time.time()
