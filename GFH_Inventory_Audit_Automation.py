@@ -3584,6 +3584,26 @@ class B2BSoftScraper:
             except Exception:
                 drv.execute_script("arguments[0].click();", element)
 
+        def _wait_for_field_or_verify(field_id: str, label: str, timeout: int = 60):
+            """Wait for a login-form field to appear, clearing any Cloudflare that blocks it."""
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("Cancelled by stop event.")
+                if _b2b_is_human_verification_page(drv):
+                    self.log(f"[B2B] Cloudflare detected before {label} — waiting to clear…")
+                    if not _b2b_wait_for_human_verification_clear(drv, stop_event=stop_event, log=self.log):
+                        raise RuntimeError(f"Cloudflare not resolved before {label}.")
+                els = drv.find_elements(By.ID, field_id)
+                if els:
+                    try:
+                        if els[0].is_displayed():
+                            return els[0]
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+            raise RuntimeError(f"B2B field #{field_id} ({label}) not visible after {timeout}s.")
+
         # ── Step 1: Company ID ─────────────────────────────────────────────
         try:
             f = wait.until(EC.visibility_of_element_located((By.ID, "companyId")))
@@ -3596,26 +3616,21 @@ class B2BSoftScraper:
         except Exception as e:
             raise RuntimeError(f"B2B Step 1 (Company ID) failed: {e}")
 
-        # Verification may appear after submitting Company ID
-        if _b2b_is_human_verification_page(self.driver):
-            if not _b2b_wait_for_human_verification_clear(self.driver, stop_event=stop_event, log=self.log):
-                raise RuntimeError("Verification challenge after Company ID was not resolved.")
-
-        # ── Step 2: Account ID ─────────────────────────────────────────────
+        # ── Step 2: Account ID — wait with Cloudflare awareness ────────────
         try:
-            f = wait.until(EC.visibility_of_element_located((By.ID, "AccountId")))
+            f = _wait_for_field_or_verify("AccountId", "Account ID", timeout=90)
             _robust_type(f, self.account_id)
             self.log(f"Account ID entered: {self.account_id}")
             time.sleep(1)
         except Exception as e:
             raise RuntimeError(f"B2B Step 2 (Account ID) failed: {e}")
 
-        # ── Step 3: Username + Password ────────────────────────────────────
+        # ── Step 3: Username + Password — wait with Cloudflare awareness ───
         try:
-            u = wait.until(EC.visibility_of_element_located((By.ID, "Username")))
+            u = _wait_for_field_or_verify("Username", "Username", timeout=60)
             _robust_type(u, self.username)
             self.log(f"Username entered: {self.username}")
-            p = wait.until(EC.visibility_of_element_located((By.ID, "Password")))
+            p = _wait_for_field_or_verify("Password", "Password", timeout=30)
             _robust_type(p, self.password)
             self.log("Password entered.")
             # Click Sign In / #btnClick — JS click, same as VidaPay
