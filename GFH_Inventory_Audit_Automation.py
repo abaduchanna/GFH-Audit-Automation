@@ -3711,20 +3711,35 @@ class TimesheetScraper:
             opts.add_experimental_option("prefs", prefs)
             self.driver = webdriver.Chrome(options=opts)
 
+    def _is_ts_logged_in(self) -> bool:
+        """Return True if the TS tab shows no login form (Firebase session still active)."""
+        from selenium.webdriver.common.by import By
+        try:
+            fields = self.driver.find_elements(
+                By.CSS_SELECTOR, "input[type='email'], input[name='email'], #email")
+            return not any(f.is_displayed() for f in fields)
+        except Exception:
+            return False
+
     def login(self) -> bool:
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
-        if not (self.email and self.password):
-            raise RuntimeError("Timesheet credentials incomplete — fill Portal Credentials tab.")
         if self.driver is None:
             self._make_driver()
         self.download_dir.mkdir(parents=True, exist_ok=True)
-        # Switch to TS tab before navigating — prevents overwriting B2B tab.
+        # Switch to TS tab — prevents overwriting B2B tab.
         _find_or_open_tab(self.driver, self.PORTAL_URL)
         self.log(f"Opening {self.PORTAL_URL}")
         self.driver.get(self.PORTAL_URL)
         time.sleep(3)
+        # If Firebase session active, skip login form entirely.
+        if self._is_ts_logged_in():
+            self.log("✓ Timesheet already logged in — skipping credentials.")
+            return True
+        # Not logged in — require credentials.
+        if not (self.email and self.password):
+            raise RuntimeError("Timesheet credentials incomplete — fill Portal Credentials tab.")
         wait = WebDriverWait(self.driver, 30)
         try:
             email_field = wait.until(EC.presence_of_element_located(
@@ -3736,6 +3751,7 @@ class TimesheetScraper:
                 By.CSS_SELECTOR, "input[type='password'], input[name='password'], #password")
             pw_field.clear()
             pw_field.send_keys(self.password)
+            self.log("Password entered.")
             submit = self.driver.find_element(
                 By.CSS_SELECTOR, "button[type='submit'], input[type='submit'], .login-btn, #loginBtn")
             submit.click()
