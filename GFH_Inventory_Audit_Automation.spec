@@ -50,6 +50,7 @@ a = Analysis(
         'selenium.common.exceptions',
         'pyperclip',
         'requests',
+        'pytesseract',
         'theme_manager',
         'logo_handler',
         'PIL',
