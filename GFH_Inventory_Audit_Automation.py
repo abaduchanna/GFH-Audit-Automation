@@ -3204,12 +3204,14 @@ def _b2b_wait_for_human_verification_clear(driver, stop_event=None, timeout: int
 
 # ── B2B post-login page-state machine (mirrors VidaPay's finish_setup_steps) ──
 
-_B2B_STATE_LOGIN     = "LOGIN"
-_B2B_STATE_VERIFY    = "HUMAN_VERIFY"
-_B2B_STATE_NEW_SIGN  = "NEW_SIGN_IN"
-_B2B_STATE_TWO_FA    = "TWO_FACTOR"
-_B2B_STATE_PORTAL    = "PORTAL"
-_B2B_STATE_UNKNOWN   = "UNKNOWN"
+_B2B_STATE_LOGIN          = "LOGIN"
+_B2B_STATE_VERIFY         = "HUMAN_VERIFY"
+_B2B_STATE_NEW_SIGN       = "NEW_SIGN_IN"
+_B2B_STATE_TWO_FA         = "TWO_FACTOR"
+_B2B_STATE_TRUST_DEVICE   = "TRUST_DEVICE"
+_B2B_STATE_READY_TO_GO    = "READY_TO_GO"
+_B2B_STATE_PORTAL         = "PORTAL"
+_B2B_STATE_UNKNOWN        = "UNKNOWN"
 
 
 def _b2b_get_body(driver) -> str:
@@ -3246,6 +3248,12 @@ def _b2b_get_page_state(driver) -> str:
     if any(k in body for k in ("2-factor", "two-factor", "authentication code",
                                 "verify your identity", "enter the code", "otp")):
         return _B2B_STATE_TWO_FA
+    # Trust This Device (appears after 2FA approval)
+    if "trust this device" in body or "trust device" in body or "remember this device" in body:
+        return _B2B_STATE_TRUST_DEVICE
+    # Ready To Go (final setup page before portal)
+    if "ready to go" in body or "you're all set" in body or "you are all set" in body:
+        return _B2B_STATE_READY_TO_GO
     # Still on login form
     try:
         if driver.find_elements(By.ID, "companyId") or driver.find_elements(By.ID, "Username"):
@@ -3326,8 +3334,61 @@ def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 30
         if state == _B2B_STATE_TWO_FA:
             now = time.time()
             if now - last_log >= 15:
-                log("B2B 2FA required — complete verification to continue…")
+                log("B2B 2FA required — approve the push notification or enter OTP to continue…")
                 last_log = now
+            time.sleep(2)
+            continue
+
+        if state == _B2B_STATE_TRUST_DEVICE:
+            log("[B2B] Trust Device page — clicking Next…")
+            if not _b2b_click_any_next(driver, log=log):
+                # Try Continue as fallback
+                from selenium.webdriver.support.ui import WebDriverWait
+                from selenium.webdriver.support import expected_conditions as EC
+                try:
+                    btn = WebDriverWait(driver, 8).until(
+                        EC.element_to_be_clickable((By.XPATH,
+                            "//button[contains(normalize-space(),'Continue')] | "
+                            "//button[contains(normalize-space(),'Trust')] | "
+                            "//input[@type='submit']"
+                        ))
+                    )
+                    driver.execute_script("arguments[0].click();", btn)
+                    log(f"Trust Device: clicked fallback button: {btn.text.strip()}")
+                except Exception:
+                    log("Trust Device: could not find any button — waiting for page to advance.")
+            last_state = None
+            time.sleep(2)
+            continue
+
+        if state == _B2B_STATE_READY_TO_GO:
+            log("[B2B] Ready To Go page — clicking Continue…")
+            from selenium.webdriver.support.ui import WebDriverWait
+            from selenium.webdriver.support import expected_conditions as EC
+            clicked = False
+            for xpath in [
+                "//button[contains(normalize-space(),'Continue')]",
+                "//button[contains(normalize-space(),'Next')]",
+                "//button[contains(normalize-space(),'Finish')]",
+                "//input[@type='submit']",
+            ]:
+                try:
+                    btn = WebDriverWait(driver, 8).until(
+                        EC.element_to_be_clickable((By.XPATH, xpath))
+                    )
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+                    try:
+                        btn.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", btn)
+                    log(f"Ready To Go: clicked {btn.text.strip() or xpath}")
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                log("Ready To Go: no button found — waiting for portal.")
+            last_state = None
             time.sleep(2)
             continue
 
