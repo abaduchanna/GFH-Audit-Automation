@@ -3442,14 +3442,48 @@ class B2BSoftScraper:
                 raise RuntimeError("Cloudflare/reCAPTCHA challenge on landing page was not resolved.")
 
         wait = WebDriverWait(self.driver, 30)
+        drv = self.driver
+
+        def _robust_type(element, text):
+            """JS-clear + event-dispatch before typing — same pattern as VidaPay extractor."""
+            drv.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+            drv.execute_script("arguments[0].click();", element)
+            try:
+                drv.execute_script(
+                    "arguments[0].value='';"
+                    "arguments[0].dispatchEvent(new Event('input',{bubbles:true}));"
+                    "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                    element,
+                )
+            except Exception:
+                pass
+            try:
+                element.clear()
+            except Exception:
+                pass
+            try:
+                existing = element.get_attribute("value") or ""
+                if existing:
+                    from selenium.webdriver.common.keys import Keys as _K
+                    element.send_keys(_K.BACK_SPACE * (len(existing) + 2))
+            except Exception:
+                pass
+            element.send_keys(text)
+
+        def _js_click(element):
+            try:
+                element.click()
+            except Exception:
+                drv.execute_script("arguments[0].click();", element)
 
         # ── Step 1: Company ID ─────────────────────────────────────────────
         try:
-            f = wait.until(EC.presence_of_element_located((By.ID, "companyId")))
-            f.clear()
-            f.send_keys(self.company_id)
+            f = wait.until(EC.visibility_of_element_located((By.ID, "companyId")))
+            _robust_type(f, self.company_id)
             self.log(f"Company ID entered: {self.company_id}")
-            wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit"))).click()
+            btn = wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit")))
+            _js_click(btn)
+            self.log("Company ID submitted.")
             time.sleep(2)
         except Exception as e:
             raise RuntimeError(f"B2B Step 1 (Company ID) failed: {e}")
@@ -3461,9 +3495,8 @@ class B2BSoftScraper:
 
         # ── Step 2: Account ID ─────────────────────────────────────────────
         try:
-            f = wait.until(EC.presence_of_element_located((By.ID, "AccountId")))
-            f.clear()
-            f.send_keys(self.account_id)
+            f = wait.until(EC.visibility_of_element_located((By.ID, "AccountId")))
+            _robust_type(f, self.account_id)
             self.log(f"Account ID entered: {self.account_id}")
             time.sleep(1)
         except Exception as e:
@@ -3471,25 +3504,28 @@ class B2BSoftScraper:
 
         # ── Step 3: Username + Password ────────────────────────────────────
         try:
-            u = wait.until(EC.presence_of_element_located((By.ID, "Username")))
-            u.clear()
-            u.send_keys(self.username)
+            u = wait.until(EC.visibility_of_element_located((By.ID, "Username")))
+            _robust_type(u, self.username)
             self.log(f"Username entered: {self.username}")
-            p = wait.until(EC.presence_of_element_located((By.ID, "Password")))
-            p.clear()
-            p.send_keys(self.password)
-            # Click Sign In / #btnClick
+            p = wait.until(EC.visibility_of_element_located((By.ID, "Password")))
+            _robust_type(p, self.password)
+            self.log("Password entered.")
+            # Click Sign In / #btnClick — JS click, same as VidaPay
+            clicked = False
             for _sel in [(By.ID, "btnClick"),
                          (By.XPATH, "//button[contains(normalize-space(),'Sign In')]"),
                          (By.XPATH, "//button[contains(normalize-space(),'Login')]"),
                          (By.XPATH, "//input[@type='submit']")]:
                 try:
                     btn = wait.until(EC.element_to_be_clickable(_sel))
-                    btn.click()
+                    _js_click(btn)
                     self.log("Login button clicked.")
+                    clicked = True
                     break
                 except Exception:
                     continue
+            if not clicked:
+                self.log("Warning: no login button found after credentials.")
             time.sleep(3)
         except Exception as e:
             raise RuntimeError(f"B2B Step 3 (Username/Password) failed: {e}")
