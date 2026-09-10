@@ -5143,13 +5143,25 @@ class B2BSoftScraper:
         from selenium.webdriver.common.by import By
         js_set_today = """
             var selects = Array.prototype.slice.call(document.querySelectorAll('select'));
+            Array.prototype.slice.call(document.querySelectorAll('.ts-wrapper'))
+                .forEach(function(w) {
+                    var s = w.querySelector('select') ||
+                        (w.parentElement ? w.parentElement.querySelector('select') : null);
+                    if (s && selects.indexOf(s) < 0) selects.push(s);
+                });
             var candidates = [];
             selects.forEach(function(s) {
+                var ts = s.tomselect;
                 var opts = Array.prototype.slice.call(s.options || []).map(function(o) {
                     return {v: o.value, t: (o.textContent || '').trim().toLowerCase()};
                 });
+                if (ts && !opts.some(function(o) { return o.t === 'today'; })) {
+                    Object.keys(ts.options || {}).forEach(function(k) {
+                        var o = ts.options[k];
+                        if (o) opts.push({v: String(o.value), t: String(o.text || '').trim().toLowerCase()});
+                    });
+                }
                 if (!opts.some(function(o) { return o.t === 'today'; })) return;
-                var ts = s.tomselect;
                 var hasM2D = opts.some(function(o) { return o.t.indexOf('month to date') >= 0; });
                 candidates.push({sel: s, ts: ts, opts: opts, m2d: hasM2D, init: !!ts});
             });
@@ -5218,9 +5230,22 @@ class B2BSoftScraper:
                 + " ; ".join(inv.get("sels") or []))
         except Exception:
             pass
-        # UI fallback: click the ts-control (or the 'Month to Date' item)
-        # to open the dropdown, then click the visible 'Today' option
-        # (data-value="2" in the real markup).
+        # UI fallback. TomSelect opens its dropdown on MOUSEDOWN, not click
+        # (user markup: .ts-control aria-expanded="false" and .ts-dropdown
+        # style="display:none") — a bare synthetic .click() never opens it,
+        # so the options never render. Dispatch the full mousedown/mouseup/
+        # click sequence on the control, give the JS-API route one more
+        # chance (opening can finish lazy init), then click the visible
+        # 'Today' option — data-value="2", class="option", id
+        # #tomselect-1-opt-3 in the user's markup.
+        def _ts_full_click(el) -> None:
+            drv.execute_script(
+                "const el = arguments[0];"
+                "const o = {bubbles: true, cancelable: true, view: window};"
+                "el.dispatchEvent(new MouseEvent('mousedown', o));"
+                "el.dispatchEvent(new MouseEvent('mouseup', o));"
+                "el.dispatchEvent(new MouseEvent('click', o));",
+                el)
         try:
             ctrl = None
             try:
@@ -5237,20 +5262,43 @@ class B2BSoftScraper:
             if ctrl is None:
                 self.log("⚠ No date-range dropdown found — exporting with the current range.")
                 return
-            drv.execute_script("arguments[0].click();", ctrl)
+            _ts_full_click(ctrl)
             time.sleep(0.8)
+            try:
+                result = str(drv.execute_script(js_set_today) or "")
+            except Exception:
+                result = ""
+            if result.startswith("ts-set:") or result.startswith("raw-set:"):
+                self.log(f"✓ Date-range dropdown set to 'Today' ({result}) — waiting for the grid to refresh.")
+                time.sleep(4)
+                return
             clicked = False
-            for opt in drv.find_elements(By.CSS_SELECTOR,
-                    ".ts-dropdown .option, [id*='ts-dropdown'] .option"):
+            opts = drv.find_elements(By.CSS_SELECTOR,
+                    ".ts-dropdown .option, [id*='ts-dropdown'] .option")
+            if not opts:
+                # Options can render outside the expected classes — fall
+                # back to any data-value element ('Today' carries
+                # data-value="2"; the Month-to-Date item data-value="0"
+                # never matches the 'today' text check).
+                opts = drv.find_elements(By.CSS_SELECTOR, "[data-value]")
+            for opt in opts:
                 if "today" in (opt.text or "").strip().lower():
-                    drv.execute_script("arguments[0].click();", opt)
+                    _ts_full_click(opt)
                     clicked = True
                     break
-            if clicked:
-                self.log("✓ Date-range dropdown set to 'Today' (UI click) — waiting for the grid to refresh.")
+            if not clicked:
+                self.log("⚠ 'Today' option not found in the date-range dropdown — exporting with the current range.")
+                return
+            time.sleep(1.2)
+            try:
+                chk = str(drv.execute_script(js_set_today) or "")
+            except Exception:
+                chk = ""
+            if chk in ("already", "already-raw") or chk.startswith("ts-set:") or chk.startswith("raw-set:"):
+                self.log(f"✓ Date-range dropdown set to 'Today' (UI click, {chk}) — waiting for the grid to refresh.")
                 time.sleep(4)
             else:
-                self.log("⚠ 'Today' option not found in the date-range dropdown — exporting with the current range.")
+                self.log(f"⚠ Clicked the Today option but the range check returned '{chk or 'no response'}' — exporting with the current range.")
         except Exception:
             self.log("⚠ No date-range dropdown found — exporting with the current range.")
 
