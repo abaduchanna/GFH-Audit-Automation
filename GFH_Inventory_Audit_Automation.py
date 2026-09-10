@@ -3202,49 +3202,155 @@ def _b2b_wait_for_human_verification_clear(driver, stop_event=None, timeout: int
     return False
 
 
-def _b2b_is_new_sign_in_page(driver) -> bool:
-    """Return True if B2B shows the 'New Sign In' unrecognized-device 2FA page."""
+# ── B2B post-login page-state machine (mirrors VidaPay's finish_setup_steps) ──
+
+_B2B_STATE_LOGIN     = "LOGIN"
+_B2B_STATE_VERIFY    = "HUMAN_VERIFY"
+_B2B_STATE_NEW_SIGN  = "NEW_SIGN_IN"
+_B2B_STATE_TWO_FA    = "TWO_FACTOR"
+_B2B_STATE_PORTAL    = "PORTAL"
+_B2B_STATE_UNKNOWN   = "UNKNOWN"
+
+
+def _b2b_get_body(driver) -> str:
     try:
-        body = driver.find_element(By.TAG_NAME, "body").text.lower()
-        return "new sign in" in body and "2-factor authentication" in body
+        return driver.find_element(By.TAG_NAME, "body").text.lower()
     except Exception:
-        return False
+        return ""
 
 
-def _b2b_click_new_sign_in_next(driver, log=print) -> bool:
-    """Click the Next button on the 'New Sign In' 2FA page."""
+def _b2b_get_page_state(driver) -> str:
+    """Classify current B2B page. Order matters — most-specific first."""
+    # Cloudflare / reCAPTCHA
+    if _b2b_is_human_verification_page(driver):
+        return _B2B_STATE_VERIFY
+    body = _b2b_get_body(driver)
+    url = ""
+    try:
+        url = driver.current_url.lower()
+    except Exception:
+        pass
+    # Portal — no login fields, on b2bsoft domain
+    if "wsreports.b2bsoft.com" in url:
+        has_login = any(
+            driver.find_elements(By.ID, fid)
+            for fid in ("companyId", "AccountId", "Username", "btnSubmit", "btnClick")
+        )
+        if not has_login:
+            if "new sign in" not in body and "2-factor" not in body and "verification" not in body:
+                return _B2B_STATE_PORTAL
+    # New Sign In (unrecognized device)
+    if "new sign in" in body or "new sign-in" in body or "unrecognized device" in body:
+        return _B2B_STATE_NEW_SIGN
+    # 2FA / IBM Verify / OTP
+    if any(k in body for k in ("2-factor", "two-factor", "authentication code",
+                                "verify your identity", "enter the code", "otp")):
+        return _B2B_STATE_TWO_FA
+    # Still on login form
+    try:
+        if driver.find_elements(By.ID, "companyId") or driver.find_elements(By.ID, "Username"):
+            return _B2B_STATE_LOGIN
+    except Exception:
+        pass
+    return _B2B_STATE_UNKNOWN
+
+
+def _b2b_click_any_next(driver, log=print) -> bool:
+    """Click any visible Next/Continue/Submit button — used for New Sign In and 2FA steps."""
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
-    try:
-        btn = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(normalize-space(), 'Next')]"))
-        )
-        btn.click()
-        log("Clicked 'Next' on New Sign In 2FA page.")
-        return True
-    except Exception as e:
-        log(f"Could not click Next on New Sign In: {e}")
-        return False
+    for xpath in [
+        "//button[contains(normalize-space(),'Next')]",
+        "//button[contains(normalize-space(),'Continue')]",
+        "//input[@type='submit']",
+        "//button[@type='submit']",
+    ]:
+        try:
+            btn = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((By.XPATH, xpath))
+            )
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            try:
+                btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+            log(f"Clicked button: {btn.text.strip() or xpath}")
+            return True
+        except Exception:
+            continue
+    return False
 
 
-def _b2b_wait_for_new_sign_in_clear(driver, stop_event=None, timeout: int = 300, log=print) -> bool:
-    """Wait until user completes 2FA and page moves past 'New Sign In'."""
-    log("Waiting for user to complete 2FA on B2B New Sign In page…")
+def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 300) -> bool:
+    """State machine for post-login B2B flow — mirrors VidaPay finish_setup_steps.
+
+    Handles:
+      - New Sign In (unrecognized device) → click Next
+      - 2FA / OTP verification → wait for user to approve (up to timeout seconds)
+      - Cloudflare re-verification → wait to clear
+      - Portal loaded → done
+    """
     deadline = time.time() + timeout
-    last_log = 0
+    last_log = 0.0
+    last_state = None
+    steps = 0
+
     while time.time() < deadline:
         if stop_event is not None and stop_event.is_set():
             return False
-        if not _b2b_is_new_sign_in_page(driver):
-            log("2FA completed — page moved forward.")
+
+        state = _b2b_get_page_state(driver)
+
+        if state != last_state:
+            log(f"[B2B] Page state: {state}")
+            last_state = state
+            steps = 0
+
+        if state == _B2B_STATE_PORTAL:
+            log("✓ B2B portal reached — login complete.")
             return True
-        now = time.time()
-        if now - last_log >= 15:
-            log("Still on B2B New Sign In page — complete 2FA to continue…")
-            last_log = now
-        time.sleep(2)
-    log("2FA wait timed out.")
+
+        if state == _B2B_STATE_VERIFY:
+            if not _b2b_wait_for_human_verification_clear(driver, stop_event=stop_event, log=log):
+                return False
+            last_state = None
+            continue
+
+        if state == _B2B_STATE_NEW_SIGN:
+            if steps == 0:
+                _b2b_click_any_next(driver, log=log)
+                steps += 1
+            time.sleep(2)
+            continue
+
+        if state == _B2B_STATE_TWO_FA:
+            now = time.time()
+            if now - last_log >= 15:
+                log("B2B 2FA required — complete verification to continue…")
+                last_log = now
+            time.sleep(2)
+            continue
+
+        if state == _B2B_STATE_LOGIN:
+            log("B2B returned to login page — credentials may be wrong.")
+            return False
+
+        # UNKNOWN — wait briefly, then re-evaluate
+        time.sleep(1)
+
+    log("B2B login flow timed out waiting for portal.")
     return False
+
+
+# Legacy stubs kept for any external callers
+def _b2b_is_new_sign_in_page(driver) -> bool:
+    return _b2b_get_page_state(driver) == _B2B_STATE_NEW_SIGN
+
+def _b2b_click_new_sign_in_next(driver, log=print) -> bool:
+    return _b2b_click_any_next(driver, log=log)
+
+def _b2b_wait_for_new_sign_in_clear(driver, stop_event=None, timeout: int = 300, log=print) -> bool:
+    return _b2b_finish_login_flow(driver, stop_event=stop_event, log=log, timeout=timeout)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3540,28 +3646,10 @@ class B2BSoftScraper:
         except Exception as e:
             raise RuntimeError(f"B2B Step 3 (Username/Password) failed: {e}")
 
-        # Verification may appear after login submit
-        if _b2b_is_human_verification_page(self.driver):
-            if not _b2b_wait_for_human_verification_clear(self.driver, stop_event=stop_event, log=self.log):
-                raise RuntimeError("Verification challenge after login submit was not resolved.")
-
-        # "New Sign In" — unrecognized device 2FA (click Next, then wait for user to complete)
-        if _b2b_is_new_sign_in_page(self.driver):
-            self.log("B2B 'New Sign In' detected — device not recognized, 2FA required.")
-            _b2b_click_new_sign_in_next(self.driver, log=self.log)
-            if not _b2b_wait_for_new_sign_in_clear(self.driver, stop_event=stop_event, log=self.log):
-                raise RuntimeError("B2B 2FA on 'New Sign In' page was not completed in time.")
-
-        # ── Confirm authentication ─────────────────────────────────────────
-        deadline = time.time() + 40
-        while time.time() < deadline:
-            if stop_event is not None and stop_event.is_set():
-                raise RuntimeError("Login cancelled by stop event.")
-            if self._is_authed():
-                self.log("✓ B2B login successful")
-                return True
-            time.sleep(1)
-        raise RuntimeError("B2B login timed out — check Company ID, Account ID, Username, Password.")
+        # Post-login state machine — handles New Sign In, 2FA, Cloudflare, portal.
+        # Mirrors VidaPay's finish_setup_steps approach.
+        if not _b2b_finish_login_flow(self.driver, stop_event=stop_event, log=self.log, timeout=300):
+            raise RuntimeError("B2B login flow did not reach portal — check credentials or complete 2FA.")
 
     def _is_authed(self) -> bool:
         from selenium.webdriver.common.by import By
