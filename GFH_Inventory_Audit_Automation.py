@@ -3316,6 +3316,16 @@ def _b2b_get_page_state(driver) -> str:
     if "ready to go" in body or "you're all set" in body or "you are all set" in body:
         return _B2B_STATE_READY_TO_GO
 
+    # ── Alerts page — portal landing showing the ALERTS (N) panel with
+    # Later-dismiss buttons. The extractor treats ALERTS as a terminal
+    # state equal to PORTAL; login/2FA pages never carry Later buttons. ──
+    try:
+        if "b2bsoft.com" in url and _b2b_find_later_buttons(driver) \
+                and "alert" in _b2b_get_body(driver):
+            return _B2B_STATE_PORTAL
+    except Exception:
+        pass
+
     # ── Portal check — on b2bsoft domain, no login fields, no 2FA text ───
     if "wsreports.b2bsoft.com" in url:
         try:
@@ -3629,9 +3639,12 @@ def _b2b_clear_later_alerts(driver, log=print, max_clicks: int = 12) -> int:
         buttons = _b2b_find_later_buttons(driver)
         if not buttons:
             idle_rounds += 1
-            if idle_rounds >= 2:
+            if idle_rounds >= 4:
                 break
-            time.sleep(0.5)
+            # Alerts pop up one at a time — give the next one time to render
+            # before concluding the panel is clear (user: there may be 1–4
+            # Later buttons, and ALL of them must be cleared).
+            time.sleep(1.5)
             continue
         idle_rounds = 0
         btn = buttons[0]
@@ -3659,8 +3672,10 @@ def _b2b_complete_setup_next_flow(driver, stop_event=None, log=print,
     """Walk every remaining 2FA setup page until the portal loads.
 
     Port of VidaPay complete_remaining_setup_next_flow:
-      Trust Device (radio + Next) → Setup Next pages (#setupNextBtn) →
-      Ready To Go (Continue) → portal. The Security Upgrade page's Next must
+      Trust Device (radio variant, or the "Trust This Device" variant with
+      only #setupNextBtn) → Setup Next pages → Ready To Go
+      (vidapayAutomaticSignIn Continue) → portal + ALERTS panel (all Later
+      buttons dismissed by the caller). The Security Upgrade page's Next must
       NOT be clicked — it throws error=io without a selected option — so we
       wait for it to advance on its own.
     """
@@ -3695,18 +3710,26 @@ def _b2b_complete_setup_next_flow(driver, stop_event=None, log=print,
             return False
 
         if state == _B2B_STATE_TRUST_DEVICE:
-            if not _b2b_select_trust_radio(driver, stop_event=stop_event, log=log):
-                return False
-            # VidaPay click_trust_device_next: primary attempt matches
-            # onclick submitthisform, fallback matches #setupNextBtn by id.
+            # Two page variants share this state:
+            #   - radio variant: #trustRadio + #setupNextBtn — Next stays
+            #     disabled until the radio is checked;
+            #   - "Trust This Device" variant (user page):
+            #     <h3>Trust This Device</h3> +
+            #     <button id="setupNextBtn">Next</button> with NO radio —
+            #     waiting 180s for one would stall the flow.
+            # So: short non-fatal radio attempt, then always click Next.
+            if not _b2b_select_trust_radio(driver, stop_event=stop_event,
+                                           log=log, timeout=6):
+                log("[B2B] No Trust Device radio appeared — clicking Next directly.")
+            # User page button: #setupNextBtn with text Next (no onclick) —
+            # id-first, onclick submitthisform as fallback.
             if not _b2b_click_button(driver, label="Trust Device Next",
                                      text_contains="next",
-                                     onclick_contains="submitthisform",
                                      button_id="setupNextBtn",
                                      timeout=30, log=log):
                 if not _b2b_click_button(driver, label="Trust Device Next fallback",
                                          text_contains="next",
-                                         button_id="setupNextBtn",
+                                         onclick_contains="submitthisform",
                                          timeout=30, log=log):
                     return False
             steps_done += 1
@@ -3729,8 +3752,17 @@ def _b2b_complete_setup_next_flow(driver, stop_event=None, log=print,
             continue
 
         if state == _B2B_STATE_READY_TO_GO:
-            clicked = _b2b_click_button(driver, label="Ready To Go Continue",
-                                        text_contains="continue", timeout=18, log=log)
+            # User page: <button onclick="vidapayAutomaticSignIn()">Continue</button>.
+            # VidaPay click_ready_to_go_continue: onclick-first, then
+            # text-only, then the old #setupNextBtn Next.
+            clicked = _b2b_click_button(
+                driver, label="Ready To Go Continue",
+                text_contains="continue", onclick_contains="vidapayautomaticsignin",
+                timeout=18, log=log)
+            if not clicked:
+                clicked = _b2b_click_button(
+                    driver, label="Ready To Go Continue fallback",
+                    text_contains="continue", timeout=18, log=log)
             if not clicked:
                 # Older B2BSoft variants reuse #setupNextBtn on Ready To Go.
                 clicked = _b2b_click_button(driver, label="Ready To Go final Next fallback",
@@ -3836,13 +3868,15 @@ def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 30
                 return False
             if _b2b_get_page_state(driver) == _B2B_STATE_TWO_FA:
                 # Radio was checked on the 2FA page itself — click its Next.
+                # id-first (user pages show #setupNextBtn without onclick),
+                # onclick submitthisform as fallback.
                 if not _b2b_click_button(
                         driver, label="2FA radio Next",
-                        text_contains="next", onclick_contains="submitthisform",
-                        button_id="setupNextBtn", timeout=30, log=log):
+                        text_contains="next", button_id="setupNextBtn",
+                        timeout=30, log=log):
                     _b2b_click_button(
                         driver, label="2FA radio Next fallback",
-                        text_contains="next", button_id="setupNextBtn",
+                        text_contains="next", onclick_contains="submitthisform",
                         timeout=10, log=log)
             last_state = None
             continue
