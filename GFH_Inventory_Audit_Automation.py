@@ -4530,6 +4530,8 @@ class GFHApp(tk.Tk):
         self._scheduler_fired_districts: set = set()
         # Tracks districts whose starting message has not yet been sent.
         self._scheduler_pending_messages: set = set()
+        # Ensures only one export cycle runs at a time — prevents 7-district simultaneous B2B+TS scrapes.
+        self._export_cycle_lock = threading.Lock()
 
         self._scheduler.start(adjusted_times, stop_time=stop_time)
         self._log_scheduler(f"▶ Started. Stops at {stop_time.strftime('%H:%M')}.")
@@ -4598,6 +4600,10 @@ class GFHApp(tk.Tk):
 
     def _scheduler_run_export_cycle(self, district: str = None) -> None:
         """Export B2B + Timesheet files, reload variances, optionally send variance image."""
+        lock = getattr(self, "_export_cycle_lock", None)
+        if lock is not None and not lock.acquire(blocking=False):
+            self._log_scheduler("⟳ Export cycle already running — skipped duplicate call.")
+            return
         self._log_scheduler("⟳ Running export cycle…")
         def _run():
             import concurrent.futures as _cf
@@ -4706,6 +4712,13 @@ class GFHApp(tk.Tk):
                 self.after(0, _reload_and_send)
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
+            finally:
+                _lock = getattr(self, "_export_cycle_lock", None)
+                if _lock is not None:
+                    try:
+                        _lock.release()
+                    except RuntimeError:
+                        pass
         threading.Thread(target=_run, daemon=True, name="ExportCycle").start()
 
     # ── Scheduler automation helpers (no-dialog versions) ───────────────────
