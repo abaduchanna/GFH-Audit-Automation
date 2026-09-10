@@ -3137,6 +3137,51 @@ def _b2b_wait_for_human_verification_clear(driver, stop_event=None, timeout: int
     return False
 
 
+def _b2b_is_new_sign_in_page(driver) -> bool:
+    """Return True if B2B shows the 'New Sign In' unrecognized-device 2FA page."""
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text.lower()
+        return "new sign in" in body and "2-factor authentication" in body
+    except Exception:
+        return False
+
+
+def _b2b_click_new_sign_in_next(driver, log=print) -> bool:
+    """Click the Next button on the 'New Sign In' 2FA page."""
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    try:
+        btn = WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(normalize-space(), 'Next')]"))
+        )
+        btn.click()
+        log("Clicked 'Next' on New Sign In 2FA page.")
+        return True
+    except Exception as e:
+        log(f"Could not click Next on New Sign In: {e}")
+        return False
+
+
+def _b2b_wait_for_new_sign_in_clear(driver, stop_event=None, timeout: int = 300, log=print) -> bool:
+    """Wait until user completes 2FA and page moves past 'New Sign In'."""
+    log("Waiting for user to complete 2FA on B2B New Sign In page…")
+    deadline = time.time() + timeout
+    last_log = 0
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        if not _b2b_is_new_sign_in_page(driver):
+            log("2FA completed — page moved forward.")
+            return True
+        now = time.time()
+        if now - last_log >= 15:
+            log("Still on B2B New Sign In page — complete 2FA to continue…")
+            last_log = now
+        time.sleep(2)
+    log("2FA wait timed out.")
+    return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 # Edge remote-debug helpers (port 9227 = user profile with --remote-debugging-port)
@@ -3213,12 +3258,14 @@ def _edge_debug_driver(port: int = EDGE_DEBUG_PORT):
 
 
 def _find_or_open_tab(driver, url: str) -> None:
-    """Switch to existing tab whose URL starts with url; open one new tab if absent."""
-    prefix = url.split("?")[0].rstrip("/")
+    """Switch to existing tab on the same origin as url; open a new tab if absent."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
     for handle in driver.window_handles:
         try:
             driver.switch_to.window(handle)
-            if driver.current_url.startswith(prefix):
+            if driver.current_url.startswith(origin):
                 return
         except Exception:
             continue
@@ -3386,6 +3433,13 @@ class B2BSoftScraper:
         if _b2b_is_human_verification_page(self.driver):
             if not _b2b_wait_for_human_verification_clear(self.driver, stop_event=stop_event, log=self.log):
                 raise RuntimeError("Verification challenge after login submit was not resolved.")
+
+        # "New Sign In" — unrecognized device 2FA (click Next, then wait for user to complete)
+        if _b2b_is_new_sign_in_page(self.driver):
+            self.log("B2B 'New Sign In' detected — device not recognized, 2FA required.")
+            _b2b_click_new_sign_in_next(self.driver, log=self.log)
+            if not _b2b_wait_for_new_sign_in_clear(self.driver, stop_event=stop_event, log=self.log):
+                raise RuntimeError("B2B 2FA on 'New Sign In' page was not completed in time.")
 
         # ── Confirm authentication ─────────────────────────────────────────
         deadline = time.time() + 40
@@ -4536,17 +4590,33 @@ class GFHApp(tk.Tk):
         """Export B2B + Timesheet files, reload variances, optionally send variance image."""
         self._log_scheduler("⟳ Running export cycle…")
         def _run():
-            try:
-                # B2B export
-                brs = B2BSoftScraper(
-                    company_id=self.brs_company_id_var.get().strip(),
-                    account_id=self.brs_account_id_var.get().strip(),
-                    username=self.brs_username_var.get().strip(),
-                    password=self.brs_password_var.get(),
-                    download_dir=EXPORT_DIR,
-                    log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[B2B] {m}")),
-                )
-                inv_file = None
+            import concurrent.futures as _cf
+
+            # Build both scrapers upfront — init drivers sequentially so
+            # _find_or_open_tab calls don't race on window handles.
+            brs = B2BSoftScraper(
+                company_id=self.brs_company_id_var.get().strip(),
+                account_id=self.brs_account_id_var.get().strip(),
+                username=self.brs_username_var.get().strip(),
+                password=self.brs_password_var.get(),
+                download_dir=EXPORT_DIR,
+                log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[B2B] {m}")),
+            )
+            brs._make_driver()
+
+            ts = TimesheetScraper(
+                email=self.ts_email_var.get().strip(),
+                password=self.ts_password_var.get(),
+                download_dir=EXPORT_DIR,
+                log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[TS] {m}")),
+            )
+            ts._make_driver()
+
+            inv_file = None
+            ts_file = None
+
+            def _run_b2b():
+                nonlocal inv_file
                 try:
                     brs.login()
                     brs.navigate_to_report()
@@ -4556,14 +4626,8 @@ class GFHApp(tk.Tk):
                 finally:
                     brs.quit()
 
-                # Timesheet export
-                ts = TimesheetScraper(
-                    email=self.ts_email_var.get().strip(),
-                    password=self.ts_password_var.get(),
-                    download_dir=EXPORT_DIR,
-                    log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[TS] {m}")),
-                )
-                ts_file = None
+            def _run_ts():
+                nonlocal ts_file
                 try:
                     ts.login()
                     ts_file = ts.download_xlsx()
@@ -4571,6 +4635,15 @@ class GFHApp(tk.Tk):
                     self.after(0, lambda: self._log_scheduler(f"⚠ Timesheet export error: {exc}"))
                 finally:
                     ts.quit()
+
+            # Run B2B and Timesheet scrapes simultaneously — each session
+            # targets its own tab via separate WebDriver connections to port 9227.
+            try:
+                with _cf.ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = [pool.submit(_run_b2b), pool.submit(_run_ts)]
+                    _cf.wait(futures)
+            except Exception as exc:
+                self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
 
                 # Reload variances and optionally send variance image
                 _district_for_send = district
