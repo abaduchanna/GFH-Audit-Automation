@@ -3424,6 +3424,49 @@ _B2B_URL = "https://wsreports.b2bsoft.com/#"
 _GFH_APP_URL = "https://gfh-telecom-app.web.app/timesheet"
 _wa_fallback_opened: bool = False  # prevent webbrowser.open firing multiple times when Edge not running
 
+# ── Tesseract / Ghostscript detection (ported from VidaPay Transfer Bot) ─────
+_TESSERACT_CANDIDATES = [
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Tesseract-OCR", "tesseract.exe"),
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "Tesseract-OCR", "tesseract.exe"),
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+    r"C:\Tesseract-OCR\tesseract.exe",
+]
+_GHOSTSCRIPT_EXES = ("gswin64c", "gswin32c", "gswin64", "gswin32", "gs")
+
+
+def _is_tesseract_installed() -> bool:
+    if shutil.which("tesseract"):
+        return True
+    return any(os.path.isfile(p) for p in _TESSERACT_CANDIDATES)
+
+
+def _locate_tesseract() -> str:
+    for p in _TESSERACT_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    found = shutil.which("tesseract")
+    return found if found else _TESSERACT_CANDIDATES[0]
+
+
+def _ghostscript_installed() -> bool:
+    for name in _GHOSTSCRIPT_EXES:
+        if shutil.which(name):
+            return True
+    import sys as _sys
+    if _sys.platform.startswith("win"):
+        for base in (r"C:\Program Files\gs", r"C:\Program Files (x86)\gs"):
+            if not os.path.isdir(base):
+                continue
+            try:
+                for ver_dir in os.listdir(base):
+                    bin_dir = os.path.join(base, ver_dir, "bin")
+                    if any(os.path.isfile(os.path.join(bin_dir, n + ".exe")) for n in _GHOSTSCRIPT_EXES):
+                        return True
+            except OSError:
+                continue
+    return False
+
 # Dedicated Edge profile for GFH automation (same pattern as VidaPay transfer bot).
 # Edge is launched with --remote-debugging-port=9227 against this profile so
 # WhatsApp, B2B, and GFH app sessions persist across restarts.
@@ -3648,6 +3691,7 @@ class B2BSoftScraper:
         def _wait_for_field_or_verify(field_id: str, label: str, timeout: int = 60):
             """Wait for a login-form field to appear, clearing any Cloudflare that blocks it."""
             deadline = time.time() + timeout
+            last_status_log = 0.0
             while time.time() < deadline:
                 if stop_event is not None and stop_event.is_set():
                     raise RuntimeError("Cancelled by stop event.")
@@ -3662,6 +3706,15 @@ class B2BSoftScraper:
                             return els[0]
                     except Exception:
                         pass
+                now = time.time()
+                if now - last_status_log >= 15:
+                    elapsed = int(now - (deadline - timeout))
+                    try:
+                        url = drv.current_url
+                    except Exception:
+                        url = "unknown"
+                    self.log(f"[B2B] Waiting for {label} ({elapsed}s elapsed, on {url})")
+                    last_status_log = now
                 time.sleep(0.5)
             raise RuntimeError(f"B2B field #{field_id} ({label}) not visible after {timeout}s.")
 
@@ -3673,13 +3726,23 @@ class B2BSoftScraper:
             btn = wait.until(EC.element_to_be_clickable((By.ID, "btnSubmit")))
             _js_click(btn)
             self.log("Company ID submitted.")
-            time.sleep(2)
+            # Wait for the companyId field to go hidden (page transition started)
+            # before polling for AccountId — prevents burning 150s on the wrong page.
+            _trans_deadline = time.time() + 20
+            while time.time() < _trans_deadline:
+                try:
+                    els = drv.find_elements(By.ID, "companyId")
+                    if not els or not els[0].is_displayed():
+                        break
+                except Exception:
+                    break
+                time.sleep(0.5)
         except Exception as e:
             raise RuntimeError(f"B2B Step 1 (Company ID) failed: {e}")
 
         # ── Step 2: Account ID — wait with Cloudflare awareness ────────────
         try:
-            f = _wait_for_field_or_verify("AccountId", "Account ID", timeout=90)
+            f = _wait_for_field_or_verify("AccountId", "Account ID", timeout=150)
             _robust_type(f, self.account_id)
             self.log(f"Account ID entered: {self.account_id}")
             time.sleep(1)
@@ -3936,32 +3999,68 @@ class TimesheetScraper:
         # Navigate to timesheet route explicitly in case login redirected elsewhere.
         if not self.driver.current_url.startswith("https://gfh-telecom-app.web.app/timesheet"):
             self.driver.get(self.PORTAL_URL)
-            time.sleep(3)
+            time.sleep(4)
+        else:
+            time.sleep(2)  # let SPA finish rendering after tab switch
 
         existing = set(self.download_dir.glob("*.xlsx"))
 
-        # Click "Today" date filter button
-        try:
-            today_btn = WebDriverWait(self.driver, 15).until(
-                EC.element_to_be_clickable((By.XPATH,
-                    "//button[normalize-space(text())='Today']")))
-            self.driver.execute_script("arguments[0].click();", today_btn)
-            self.log("Clicked 'Today' filter on timesheet.")
+        # Click "Today" date filter button — try up to 3 times (SPA may still render)
+        _today_xpaths = [
+            "//button[normalize-space(.)='Today']",
+            "//button[contains(normalize-space(.),'Today') and not(contains(normalize-space(.),'Yesterday'))]",
+            "//*[@role='button' and normalize-space(.)='Today']",
+        ]
+        _today_clicked = False
+        for _attempt in range(3):
+            for _xp in _today_xpaths:
+                try:
+                    _btn = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, _xp)))
+                    try:
+                        _btn.click()
+                    except Exception:
+                        self.driver.execute_script("arguments[0].click();", _btn)
+                    self.log("Clicked 'Today' filter on timesheet.")
+                    _today_clicked = True
+                    break
+                except Exception:
+                    continue
+            if _today_clicked:
+                break
+            time.sleep(2)
+        if not _today_clicked:
+            self.log("Warning: could not click 'Today' button — proceeding to export anyway.")
+        else:
             time.sleep(3)
-        except Exception as e:
-            self.log(f"Warning: could not click 'Today' button: {e}")
 
         # Click "Export Excel" (first match — not "Export B2B Hours" or "Export Bi-Weekly")
-        try:
-            export_btn = WebDriverWait(self.driver, 15).until(
-                EC.element_to_be_clickable((By.XPATH,
-                    "//button[contains(normalize-space(.), 'Export Excel') and "
-                    "not(contains(normalize-space(.), 'B2B')) and "
-                    "not(contains(normalize-space(.), 'Bi-Weekly'))]")))
-            self.driver.execute_script("arguments[0].click();", export_btn)
-            self.log("Clicked 'Export Excel' on timesheet.")
-        except Exception as e:
-            self.log(f"Warning: could not click 'Export Excel': {e}")
+        _export_xpaths = [
+            "//button[contains(normalize-space(.), 'Export Excel') and "
+            "not(contains(normalize-space(.), 'B2B')) and "
+            "not(contains(normalize-space(.), 'Bi-Weekly'))]",
+            "//button[normalize-space(.)='Export Excel']",
+        ]
+        _export_clicked = False
+        for _attempt in range(3):
+            for _xp in _export_xpaths:
+                try:
+                    _btn = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.XPATH, _xp)))
+                    try:
+                        _btn.click()
+                    except Exception:
+                        self.driver.execute_script("arguments[0].click();", _btn)
+                    self.log("Clicked 'Export Excel' on timesheet.")
+                    _export_clicked = True
+                    break
+                except Exception:
+                    continue
+            if _export_clicked:
+                break
+            time.sleep(2)
+        if not _export_clicked:
+            self.log("Warning: could not click 'Export Excel'.")
 
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -4920,6 +5019,15 @@ class GFHApp(tk.Tk):
             return
         self._log_scheduler("⟳ Running export cycle…")
         def _run():
+            # Pre-open separate tabs for B2B and TS so each scraper gets its own tab.
+            try:
+                _pre_driver = _edge_debug_driver()
+                _find_or_open_tab(_pre_driver, _B2B_URL)
+                _find_or_open_tab(_pre_driver, _GFH_APP_URL)
+                self.after(0, lambda: self._log_scheduler("Opened B2B and TS tabs."))
+            except Exception:
+                pass
+
             # Build both scrapers upfront — init tab handles sequentially before scraping.
             brs = B2BSoftScraper(
                 company_id=self.brs_company_id_var.get().strip(),
@@ -5163,19 +5271,19 @@ class GFHApp(tk.Tk):
         """Continuously grab the screen area where WhatsApp notifications appear and read IMEIs."""
         import re as _re
         import datetime as _dt
+        if not _is_tesseract_installed():
+            self.after(0, lambda: self._log_scheduler(
+                "⚠ Tesseract OCR binary not found — OCR monitor disabled. "
+                "Install from https://github.com/UB-Mannheim/tesseract/wiki"))
+            self._wa_ocr_running = False
+            return
         try:
             import pytesseract
-            import os as _os
-            _tess_candidates = [
-                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-            ]
-            for _c in _tess_candidates:
-                if _os.path.isfile(_c):
-                    pytesseract.pytesseract.tesseract_cmd = _c
-                    break
+            pytesseract.pytesseract.tesseract_cmd = _locate_tesseract()
         except ImportError:
-            self.after(0, lambda: self._log_scheduler("⚠ pytesseract not installed — OCR monitor disabled."))
+            self.after(0, lambda: self._log_scheduler(
+                "⚠ pytesseract Python package not installed — OCR monitor disabled. "
+                "Run: pip install pytesseract"))
             self._wa_ocr_running = False
             return
 
