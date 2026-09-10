@@ -17,8 +17,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 THEME_MANAGER = ROOT / "theme_manager.py"
 HEADER_MANAGER = ROOT / "header_manager.py"
 APP_FILES = [
-    ROOT / "GFH_Inventory_Audit.py",
-    ROOT / "GFH_Inventory_Audit_Timesheet.py",
+    ROOT / "GFH_Inventory_Audit_Automation.py",
 ]
 
 

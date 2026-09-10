@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = REPO_ROOT / "GFH_Inventory_Audit_Timesheet.py"
+SCRIPT = REPO_ROOT / "GFH_Inventory_Audit_Automation.py"
 
 NEEDED_FUNCS = [
     "safe_text",
