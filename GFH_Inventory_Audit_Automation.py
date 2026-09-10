@@ -3618,27 +3618,37 @@ class TimesheetScraper:
         except Exception as e:
             raise RuntimeError(f"Timesheet login failed: {e}")
 
-    def download_xlsx(self, timeout: int = 45) -> Optional[Path]:
-        """Try to trigger a timesheet XLSX download."""
+    def download_xlsx(self, timeout: int = 60) -> Optional[Path]:
+        """Click 'Today' filter then 'Export Excel' to download today's timesheet."""
         from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+
         existing = set(self.download_dir.glob("*.xlsx"))
+
+        # Click "Today" date filter button
         try:
-            for text in ["export", "download", "xlsx", "excel"]:
-                btns = self.driver.find_elements(By.XPATH,
-                    f"//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
-                    f"'abcdefghijklmnopqrstuvwxyz'),'{text}')] | "
-                    f"//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
-                    f"'abcdefghijklmnopqrstuvwxyz'),'{text}')]")
-                for btn in btns:
-                    try:
-                        self.driver.execute_script("arguments[0].click();", btn)
-                        self.log(f"Clicked timesheet export: {text}")
-                        time.sleep(3)
-                        break
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+            today_btn = WebDriverWait(self.driver, 15).until(
+                EC.element_to_be_clickable((By.XPATH,
+                    "//button[normalize-space(text())='Today']")))
+            self.driver.execute_script("arguments[0].click();", today_btn)
+            self.log("Clicked 'Today' filter on timesheet.")
+            time.sleep(3)
+        except Exception as e:
+            self.log(f"Warning: could not click 'Today' button: {e}")
+
+        # Click "Export Excel" (first match — not "Export B2B Hours" or "Export Bi-Weekly")
+        try:
+            export_btn = WebDriverWait(self.driver, 15).until(
+                EC.element_to_be_clickable((By.XPATH,
+                    "//button[contains(normalize-space(.), 'Export Excel') and "
+                    "not(contains(normalize-space(.), 'B2B')) and "
+                    "not(contains(normalize-space(.), 'Bi-Weekly'))]")))
+            self.driver.execute_script("arguments[0].click();", export_btn)
+            self.log("Clicked 'Export Excel' on timesheet.")
+        except Exception as e:
+            self.log(f"Warning: could not click 'Export Excel': {e}")
+
         deadline = time.time() + timeout
         while time.time() < deadline:
             new_files = set(self.download_dir.glob("*.xlsx")) - existing
