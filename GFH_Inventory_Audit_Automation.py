@@ -2684,21 +2684,86 @@ class WhatsAppSender:
         self.log(f"Sent text to {group_name}")
 
     def _send_text_web(self, group_name: str, text_message: str) -> None:
-        """Send text via WhatsApp Web — opens in user's Edge profile (port 9227), reuses existing tab."""
+        """Send text via WhatsApp Web in Edge at port 9227. Keeps tab open after send."""
         global _wa_fallback_opened
         message = safe_text(text_message)
         if not message:
             return
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.common.keys import Keys
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
         try:
             driver = _edge_debug_driver()
             _find_or_open_tab(driver, _WA_URL)
-        except Exception:
+            wait = WebDriverWait(driver, 30)
+            # Find search box (WA Web uses contenteditable divs; try multiple selectors)
+            search_box = None
+            for by, sel in [
+                (By.CSS_SELECTOR, "div[contenteditable='true'][data-tab='3']"),
+                (By.XPATH, "//div[@contenteditable='true'][@title='Search input textbox']"),
+                (By.CSS_SELECTOR, "div[data-testid='chat-list-search']"),
+            ]:
+                try:
+                    search_box = wait.until(EC.element_to_be_clickable((by, sel)))
+                    break
+                except Exception:
+                    continue
+            if search_box is None:
+                self.log(f"WhatsApp Web: could not find search box for {group_name!r}")
+                return
+            search_box.click()
+            search_box.send_keys(Keys.CONTROL + "a")
+            search_box.send_keys(Keys.DELETE)
+            search_box.send_keys(group_name)
+            time.sleep(2)
+            # Click first result whose title contains group_name
+            clicked = False
+            for by, sel in [
+                (By.XPATH, f"//span[contains(@title, '{group_name}')]"),
+                (By.CSS_SELECTOR, "div[data-testid='cell-frame-container']"),
+            ]:
+                try:
+                    result = wait.until(EC.element_to_be_clickable((by, sel)))
+                    result.click()
+                    clicked = True
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                self.log(f"WhatsApp Web: group {group_name!r} not found in results")
+                return
+            time.sleep(1)
+            # Find message input box
+            msg_box = None
+            for by, sel in [
+                (By.CSS_SELECTOR, "div[contenteditable='true'][data-tab='10']"),
+                (By.CSS_SELECTOR, "div[contenteditable='true'][data-tab='6']"),
+                (By.XPATH, "//div[@contenteditable='true'][@title='Type a message']"),
+            ]:
+                try:
+                    msg_box = wait.until(EC.element_to_be_clickable((by, sel)))
+                    break
+                except Exception:
+                    continue
+            if msg_box is None:
+                self.log(f"WhatsApp Web: could not find message input for {group_name!r}")
+                return
+            msg_box.click()
+            import pyperclip
+            pyperclip.copy(message)
+            msg_box.send_keys(Keys.CONTROL + "v")
+            time.sleep(0.5)
+            msg_box.send_keys(Keys.ENTER)
+            time.sleep(0.5)
+            self.log(f"✓ WhatsApp Web: sent to {group_name!r}")
+            # Tab stays open — do not close driver or switch away
+        except Exception as e:
+            self.log(f"WhatsApp Web send error ({group_name!r}): {e}")
             if not _wa_fallback_opened:
                 import webbrowser
                 webbrowser.open(_WA_URL)
                 _wa_fallback_opened = True
-        self.log(f"WhatsApp Web: {group_name!r} | Message: {message!r}")
-        self.log("Tip: find the group in WhatsApp Web (Ctrl+F) and paste the message.")
 
 
 
@@ -4606,10 +4671,7 @@ class GFHApp(tk.Tk):
             return
         self._log_scheduler("⟳ Running export cycle…")
         def _run():
-            import concurrent.futures as _cf
-
-            # Build both scrapers upfront — init drivers sequentially so
-            # _find_or_open_tab calls don't race on window handles.
+            # Build both scrapers upfront — init tab handles sequentially before scraping.
             brs = B2BSoftScraper(
                 company_id=self.brs_company_id_var.get().strip(),
                 account_id=self.brs_account_id_var.get().strip(),
@@ -4652,12 +4714,12 @@ class GFHApp(tk.Tk):
                 finally:
                     ts.quit()
 
-            # Run B2B and Timesheet scrapes simultaneously — each session
-            # targets its own tab via separate WebDriver connections to port 9227.
+            # Run B2B then Timesheet sequentially — both share the same Edge browser
+            # (port 9227). Parallel switch_to.window() calls on the same browser
+            # race and corrupt each other's tab focus.
             try:
-                with _cf.ThreadPoolExecutor(max_workers=2) as pool:
-                    futures = [pool.submit(_run_b2b), pool.submit(_run_ts)]
-                    _cf.wait(futures)
+                _run_b2b()
+                _run_ts()
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
 
