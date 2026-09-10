@@ -3221,45 +3221,104 @@ def _b2b_get_body(driver) -> str:
         return ""
 
 
+def _b2b_has_heading(driver, phrase: str) -> bool:
+    """JS-based heading check — works before body.text populates (SPA render lag).
+    Checks visible h1/h2/h3/h4 elements, same approach as VidaPay has_h3_heading."""
+    phrase = phrase.lower().strip()
+    try:
+        texts = driver.execute_script(
+            """
+            return Array.from(document.querySelectorAll('h1,h2,h3,h4,legend')).map(function(el) {
+                var style = window.getComputedStyle(el);
+                var rect = el.getBoundingClientRect();
+                var visible = style.display !== 'none' && style.visibility !== 'hidden'
+                              && rect.width > 0 && rect.height > 0;
+                return visible ? (el.innerText || el.textContent || '').trim().toLowerCase() : '';
+            }).filter(Boolean);
+            """
+        )
+        return any(phrase in str(t) for t in (texts or []))
+    except Exception:
+        return phrase in _b2b_get_body(driver)
+
+
 def _b2b_get_page_state(driver) -> str:
-    """Classify current B2B page. Order matters — most-specific first."""
-    # Cloudflare / reCAPTCHA
+    """Classify current B2B page.
+
+    Detection order (most-specific first):
+      1. URL keyword — immediate, works before SPA body text renders.
+      2. JS heading check — visible h1-h4, faster than body.text on SPA.
+      3. body.text fallback — plain text, slower but broadest coverage.
+
+    Mirrors VidaPay get_page_state URL+heading strategy exactly.
+    """
+    # Cloudflare / reCAPTCHA — check first, URL might be whitelisted
     if _b2b_is_human_verification_page(driver):
         return _B2B_STATE_VERIFY
-    body = _b2b_get_body(driver)
+
     url = ""
     try:
         url = driver.current_url.lower()
     except Exception:
         pass
-    # Portal — no login fields, on b2bsoft domain
-    if "wsreports.b2bsoft.com" in url:
-        has_login = any(
-            driver.find_elements(By.ID, fid)
-            for fid in ("companyId", "AccountId", "Username", "btnSubmit", "btnClick")
-        )
-        if not has_login:
-            if "new sign in" not in body and "2-factor" not in body and "verification" not in body:
-                return _B2B_STATE_PORTAL
-    # New Sign In (unrecognized device)
-    if "new sign in" in body or "new sign-in" in body or "unrecognized device" in body:
+
+    # ── URL-based detection (instant, no SPA render needed) ──────────────
+    # B2BSoft uses same URL slug patterns as VidaPay portal.
+    if "twofactornewdevicesignin" in url or "newdevicesignin" in url:
         return _B2B_STATE_NEW_SIGN
-    # 2FA / IBM Verify / OTP
+    if "twofactorcheck" in url or "twofactor/check" in url:
+        return _B2B_STATE_TWO_FA
+    if "twofactorupdatename" in url or "trustdevice" in url:
+        return _B2B_STATE_TRUST_DEVICE
+    if "twofactorready" in url or "readytogo" in url:
+        return _B2B_STATE_READY_TO_GO
+    if "secureupgradeoptions" in url or "securityupgrade" in url:
+        return _B2B_STATE_UNKNOWN  # unsupported upgrade page — wait it out
+
+    # ── Heading-based detection (works during SPA partial render) ─────────
+    if _b2b_has_heading(driver, "new sign in"):
+        return _B2B_STATE_NEW_SIGN
+    if (_b2b_has_heading(driver, "2-factor authentication") or
+            _b2b_has_heading(driver, "two-factor authentication") or
+            _b2b_has_heading(driver, "verify your identity")):
+        return _B2B_STATE_TWO_FA
+    if _b2b_has_heading(driver, "trust this device") or _b2b_has_heading(driver, "trust device"):
+        return _B2B_STATE_TRUST_DEVICE
+    if _b2b_has_heading(driver, "ready to go") or _b2b_has_heading(driver, "you're all set"):
+        return _B2B_STATE_READY_TO_GO
+
+    # ── body.text fallback (slowest — SPA must have fully rendered) ───────
+    body = _b2b_get_body(driver)
+
+    if "new sign in" in body or "new sign-in" in body or "don't recognize this device" in body or "unrecognized device" in body:
+        return _B2B_STATE_NEW_SIGN
     if any(k in body for k in ("2-factor", "two-factor", "authentication code",
                                 "verify your identity", "enter the code", "otp")):
         return _B2B_STATE_TWO_FA
-    # Trust This Device (appears after 2FA approval)
     if "trust this device" in body or "trust device" in body or "remember this device" in body:
         return _B2B_STATE_TRUST_DEVICE
-    # Ready To Go (final setup page before portal)
     if "ready to go" in body or "you're all set" in body or "you are all set" in body:
         return _B2B_STATE_READY_TO_GO
-    # Still on login form
+
+    # ── Portal check — on b2bsoft domain, no login fields, no 2FA text ───
+    if "wsreports.b2bsoft.com" in url:
+        try:
+            has_login = any(
+                driver.find_elements(By.ID, fid)
+                for fid in ("companyId", "AccountId", "Username", "btnSubmit", "btnClick")
+            )
+        except Exception:
+            has_login = False
+        if not has_login:
+            return _B2B_STATE_PORTAL
+
+    # ── Still on login form ───────────────────────────────────────────────
     try:
         if driver.find_elements(By.ID, "companyId") or driver.find_elements(By.ID, "Username"):
             return _B2B_STATE_LOGIN
     except Exception:
         pass
+
     return _B2B_STATE_UNKNOWN
 
 
@@ -3396,8 +3455,8 @@ def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 30
             log("B2B returned to login page — credentials may be wrong.")
             return False
 
-        # UNKNOWN — wait briefly, then re-evaluate
-        time.sleep(1)
+        # UNKNOWN — SPA may still be rendering; wait before re-evaluating
+        time.sleep(2)
 
     log("B2B login flow timed out waiting for portal.")
     return False
@@ -3781,7 +3840,7 @@ class B2BSoftScraper:
                 self.log("URL changed after login.")
             except Exception:
                 self.log("URL did not change after login click — continuing.")
-            time.sleep(2)
+            time.sleep(3)  # give SPA time to render heading/body before state machine reads
         except Exception as e:
             raise RuntimeError(f"B2B Step 3 (Username/Password) failed: {e}")
 
