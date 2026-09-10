@@ -4530,29 +4530,98 @@ class B2BSoftScraper:
         except Exception as e:
             raise RuntimeError(f"B2B Step 2 (Account ID) failed: {e}")
 
-        # ── Step 3: Username + Password — wait with Cloudflare awareness ───
-        try:
-            u = _wait_for_field_or_verify("Username", "Username", timeout=60)
-            _robust_type(u, self.username)
-            self.log(f"Username entered: {self.username}")
-            p = _wait_for_field_or_verify("Password", "Password", timeout=30)
-            _robust_type(p, self.password)
+        # Wait for the first visible field among candidate locators —
+        # Cloudflare-aware, with the same 15s diagnostics as the ID waits.
+        def _wait_for_any_field(candidates, label: str, timeout: int = 40):
+            deadline = time.time() + timeout
+            last_status_log = 0.0
+            while time.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("Cancelled by stop event.")
+                if _b2b_is_human_verification_page(drv):
+                    self.log(f"Cloudflare detected before {label} — waiting to clear…")
+                    if not _b2b_wait_for_human_verification_clear(drv, stop_event=stop_event, log=self.log):
+                        raise RuntimeError(f"Cloudflare not resolved before {label}.")
+                for by, sel in candidates:
+                    try:
+                        els = drv.find_elements(by, sel)
+                    except Exception:
+                        continue
+                    if els:
+                        try:
+                            if els[0].is_displayed():
+                                return els[0]
+                        except Exception:
+                            pass
+                now = time.time()
+                if now - last_status_log >= 15:
+                    elapsed = int(now - (deadline - timeout))
+                    try:
+                        url = drv.current_url
+                    except Exception:
+                        url = "unknown"
+                    self.log(f"Waiting for {label} ({elapsed}s elapsed, on {url})")
+                    _fields = _visible_fields_snapshot()
+                    if _fields:
+                        self.log(f"Visible fields on page: {', '.join(_fields)}")
+                    last_status_log = now
+                time.sleep(0.5)
+            raise RuntimeError(f"B2B field ({label}) not visible after {timeout}s.")
+
+        # ── Step 3: Username + Password — ported from vidapay-extractor
+        # login_store: multi-strategy field location (the SSO sign-in page
+        # may not use #Username/#Password ids), submit via text-matched
+        # button (Next / Sign In / Log in — force-enabled before clicking,
+        # SSO renders it disabled until its JS validates the fields), and
+        # invalid-credential re-entry.
+        _user_candidates = [
+            (By.ID, "Username"),
+            (By.XPATH, "//label[contains(normalize-space(),'User Name')]/following::input[1]"),
+            (By.XPATH, "//label[contains(normalize-space(),'Username')]/following::input[1]"),
+            (By.XPATH, "//input[contains(@placeholder,'User') or contains(@name,'user') or contains(@id,'user')]"),
+            (By.XPATH, "//input[@type='email']"),
+            (By.XPATH, "(//input[not(@type='hidden') and not(@type='password')])[2]"),
+        ]
+        _pass_candidates = [
+            (By.ID, "Password"),
+            (By.XPATH, "//input[@type='password']"),
+            (By.XPATH, "//label[contains(normalize-space(),'Password')]/following::input[1]"),
+        ]
+
+        def _fill_credentials() -> None:
+            u = _wait_for_any_field(_user_candidates, "Username", timeout=60)
+            got_u = _type_and_verify(u, self.username)
+            self.log(f"Username entered: {got_u}")
+            p = _wait_for_any_field(_pass_candidates, "Password", timeout=30)
+            _type_and_verify(p, self.password)
             self.log("Password entered.")
-            # Click Sign In / #btnClick — JS click, same as VidaPay
-            clicked = False
-            for _sel in [(By.ID, "btnClick"),
-                         (By.XPATH, "//button[contains(normalize-space(),'Sign In')]"),
-                         (By.XPATH, "//button[contains(normalize-space(),'Login')]"),
-                         (By.XPATH, "//input[@type='submit']")]:
-                try:
-                    btn = wait.until(EC.element_to_be_clickable(_sel))
-                    _js_click(btn)
-                    self.log("Login button clicked.")
-                    clicked = True
-                    break
-                except Exception:
-                    continue
-            if not clicked:
+
+        def _submit_credentials() -> bool:
+            # Same button-matching chain as vidapay-extractor: the SSO
+            # sign-in button is force-enabled and clicked via JS (native
+            # click first, MouseEvent fallback). "Next" first — that is the
+            # button the SSO sign-in page actually shows.
+            for _btn_label, kwargs in [
+                ("#btnClick verify button", {"button_id": "btnClick", "timeout": 6}),
+                ("Next button", {"text_contains": "next", "timeout": 8}),
+                ("Sign In button", {"text_contains": "sign in", "timeout": 6}),
+                ("Log In button", {"text_contains": "log in", "timeout": 4}),
+                ("Login button", {"text_contains": "login", "timeout": 4}),
+                ("Continue button", {"text_contains": "continue", "timeout": 4}),
+            ]:
+                if _b2b_click_button(drv, label=_btn_label, log=self.log, **kwargs):
+                    return True
+            try:
+                btn = drv.find_element(By.XPATH, "//input[@type='submit']")
+                _js_click(btn)
+                self.log("Clicked input[type=submit].")
+                return True
+            except Exception:
+                return False
+
+        try:
+            _fill_credentials()
+            if not _submit_credentials():
                 self.log("Warning: no login button found after credentials.")
             # Wait for URL change (page navigates away from login) — mirrors VidaPay.
             old_url = drv.current_url
@@ -4562,6 +4631,32 @@ class B2BSoftScraper:
                 self.log("URL changed after login.")
             except Exception:
                 self.log("URL did not change after login click — continuing.")
+            # Invalid-credentials detection + re-entry (extractor login_store).
+            for _cred_retry in range(2):
+                time.sleep(1.5)
+                try:
+                    invalid = drv.execute_script("""
+                        const items = Array.from(document.querySelectorAll('li, .error, .alert, [class*="error"], [class*="invalid"], [class*="alert"]'));
+                        for (const el of items) {
+                            const t = (el.innerText || '').toLowerCase();
+                            if (t.includes('invalid') || t.includes('incorrect') || t.includes('wrong') || t.includes('failed')) {
+                                return el.innerText.trim();
+                            }
+                        }
+                        return null;
+                    """)
+                except Exception:
+                    invalid = None
+                if not invalid:
+                    break
+                self.log(f"Login error detected: '{invalid}' — re-entering credentials (attempt {_cred_retry + 2})...")
+                time.sleep(1)
+                try:
+                    _fill_credentials()
+                    _submit_credentials()
+                except Exception as ce:
+                    self.log(f"Credential retry failed: {ce}")
+                    break
             time.sleep(3)  # give SPA time to render heading/body before state machine reads
         except Exception as e:
             raise RuntimeError(f"B2B Step 3 (Username/Password) failed: {e}")
