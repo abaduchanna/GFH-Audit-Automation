@@ -5128,40 +5128,56 @@ class B2BSoftScraper:
         item data-value="0"; the dropdown option data-value="2" is Today).
         Exporting without switching produces a month-to-date file
         (Inventory_Count_Result_Details_09012026-09102026.Xlsx) instead of
-        today's counts. Primary route: the TomSelect JS API (setValue —
-        fires the change event the report grid listens to). Fallback: open
-        the dropdown and click the visible 'Today' option.
+        today's counts.
+
+        The 16:49 run showed the TomSelect is created only AFTER the
+        report's initial data load finishes — the old 10s polling window
+        expired before the widget existed ("No date-range dropdown
+        found"). Now: poll up to 30s; drive an initialized TomSelect via
+        its JS API when present, else set the RAW <select> value (the
+        widget adopts it at init) and dispatch change; UI-click fallback
+        on .ts-control / the 'Month to Date' item; and when everything
+        misses, log the page's <select> inventory so the next run is
+        diagnosable from the log alone.
         """
         from selenium.webdriver.common.by import By
         js_set_today = """
+            var selects = Array.prototype.slice.call(document.querySelectorAll('select'));
             var candidates = [];
-            document.querySelectorAll('select').forEach(function(s) {
-                var ts = s.tomselect;
-                if (!ts) return;
-                var hasToday = false, hasM2D = false;
-                Object.keys(ts.options || {}).forEach(function(k) {
-                    var t = ((ts.options[k] && ts.options[k].text) + '').trim().toLowerCase();
-                    if (t === 'today') hasToday = true;
-                    if (t.indexOf('month to date') >= 0) hasM2D = true;
+            selects.forEach(function(s) {
+                var opts = Array.prototype.slice.call(s.options || []).map(function(o) {
+                    return {v: o.value, t: (o.textContent || '').trim().toLowerCase()};
                 });
-                if (hasToday) candidates.push({ts: ts, m2d: hasM2D});
+                if (!opts.some(function(o) { return o.t === 'today'; })) return;
+                var ts = s.tomselect;
+                var hasM2D = opts.some(function(o) { return o.t.indexOf('month to date') >= 0; });
+                candidates.push({sel: s, ts: ts, opts: opts, m2d: hasM2D, init: !!ts});
             });
             if (!candidates.length) return 'no-ts';
-            candidates.sort(function(a, b) { return (b.m2d ? 1 : 0) - (a.m2d ? 1 : 0); });
-            var sel = candidates[0].ts;
-            var chosen = null;
-            Object.keys(sel.options).forEach(function(k) {
-                var o = sel.options[k];
-                if (o && ((o.text || '') + '').trim().toLowerCase() === 'today') chosen = o;
+            candidates.sort(function(a, b) {
+                return ((b.init ? 2 : 0) + (b.m2d ? 1 : 0))
+                     - ((a.init ? 2 : 0) + (a.m2d ? 1 : 0));
             });
+            var c = candidates[0];
+            var chosen = null;
+            for (var i = 0; i < c.opts.length; i++) {
+                if (c.opts[i].t === 'today') { chosen = c.opts[i]; break; }
+            }
             if (!chosen) return 'no-option';
-            if ((sel.getValue() + '') === (chosen.value + '')) return 'already';
-            sel.setValue(chosen.value);
-            var item = sel.wrapper ? sel.wrapper.querySelector('.item') : null;
-            return 'set:' + (item ? (item.textContent || '').trim() : chosen.value);
+            if (c.ts) {
+                if ((c.ts.getValue() + '') === (chosen.v + '')) return 'already';
+                c.ts.setValue(chosen.v);
+                var item = c.ts.wrapper ? c.ts.wrapper.querySelector('.item') : null;
+                return 'ts-set:' + (item ? (item.textContent || '').trim() : chosen.v);
+            }
+            if ((c.sel.value + '') === (chosen.v + '')) return 'already-raw';
+            c.sel.value = chosen.v;
+            c.sel.dispatchEvent(new Event('input', {bubbles: true}));
+            c.sel.dispatchEvent(new Event('change', {bubbles: true}));
+            return 'raw-set:' + chosen.v;
         """
         result = ""
-        deadline = time.time() + 10
+        deadline = time.time() + 30
         while time.time() < deadline:
             try:
                 result = str(drv.execute_script(js_set_today) or "")
@@ -5170,31 +5186,73 @@ class B2BSoftScraper:
             if result and result != "no-ts":
                 break
             time.sleep(0.5)
-        if result.startswith("set:"):
-            self.log(f"✓ Date-range dropdown set to 'Today' ({result}).")
-        elif result == "already":
+        if result.startswith("ts-set:") or result.startswith("raw-set:"):
+            self.log(
+                f"✓ Date-range dropdown set to 'Today' ({result}) — "
+                "waiting for the grid to refresh.")
+            time.sleep(4)
+            return
+        if result in ("already", "already-raw"):
             self.log("Date-range dropdown already on 'Today'.")
-        else:
-            # UI fallback: click the ts-control to open the dropdown, then
-            # click the visible 'Today' option (data-value="2" in the real
-            # markup).
+            return
+        # Still nothing — log what the page DOES have before the UI
+        # fallback, so a variant page is diagnosable from the log alone.
+        try:
+            inv = drv.execute_script("""
+                var sels = Array.prototype.slice.call(document.querySelectorAll('select'));
+                var out = [];
+                sels.slice(0, 8).forEach(function(s) {
+                    var opts = Array.prototype.slice.call(s.options || [])
+                        .slice(0, 6).map(function(o) { return (o.textContent || '').trim(); })
+                        .filter(function(t) { return t; });
+                    out.push((s.id ? '#' + s.id : (s.name ? '[name=' + s.name + ']' : 'select'))
+                        + (s.tomselect ? '[ts]' : '[raw]')
+                        + (opts.length ? '{' + opts.join(' | ') + '}' : '{}'));
+                });
+                return {n: sels.length, sels: out,
+                        tsCtrl: document.querySelectorAll('.ts-control').length};
+            """) or {}
+            self.log(
+                f"Date-range scan: {inv.get('n')} <select> element(s), "
+                f"{inv.get('tsCtrl')} .ts-control: "
+                + " ; ".join(inv.get("sels") or []))
+        except Exception:
+            pass
+        # UI fallback: click the ts-control (or the 'Month to Date' item)
+        # to open the dropdown, then click the visible 'Today' option
+        # (data-value="2" in the real markup).
+        try:
+            ctrl = None
             try:
                 ctrl = drv.find_element(By.CSS_SELECTOR, ".ts-control")
-                drv.execute_script("arguments[0].click();", ctrl)
-                time.sleep(0.8)
-                clicked = False
-                for opt in drv.find_elements(By.CSS_SELECTOR,
-                        ".ts-dropdown .option, [id*='ts-dropdown'] .option"):
-                    if "today" in (opt.text or "").strip().lower():
-                        drv.execute_script("arguments[0].click();", opt)
-                        clicked = True
-                        break
-                if clicked:
-                    self.log("✓ Date-range dropdown set to 'Today' (UI click).")
-                else:
-                    self.log("⚠ 'Today' option not found in the date-range dropdown — exporting with the current range.")
             except Exception:
+                for el in drv.find_elements(By.XPATH,
+                        "//*[normalize-space(text())='Month to Date']"):
+                    try:
+                        if el.is_displayed():
+                            ctrl = el
+                            break
+                    except Exception:
+                        continue
+            if ctrl is None:
                 self.log("⚠ No date-range dropdown found — exporting with the current range.")
+                return
+            drv.execute_script("arguments[0].click();", ctrl)
+            time.sleep(0.8)
+            clicked = False
+            for opt in drv.find_elements(By.CSS_SELECTOR,
+                    ".ts-dropdown .option, [id*='ts-dropdown'] .option"):
+                if "today" in (opt.text or "").strip().lower():
+                    drv.execute_script("arguments[0].click();", opt)
+                    clicked = True
+                    break
+            if clicked:
+                self.log("✓ Date-range dropdown set to 'Today' (UI click) — waiting for the grid to refresh.")
+                time.sleep(4)
+            else:
+                self.log("⚠ 'Today' option not found in the date-range dropdown — exporting with the current range.")
+        except Exception:
+            self.log("⚠ No date-range dropdown found — exporting with the current range.")
 
     def download_xlsx(self, timeout: int = 45) -> Optional[Path]:
         """Try to trigger an XLSX download and return the file path."""
