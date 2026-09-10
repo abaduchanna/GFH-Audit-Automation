@@ -4057,18 +4057,39 @@ def _edge_debug_driver(port: int = EDGE_DEBUG_PORT):
     return webdriver.Edge(options=opts)
 
 
+# Tabs that Edge starts with and that are safe to REUSE for a real page
+# (the automation Edge is launched with a about:blank start tab — navigating
+# it beats spawning a second tab and leaving the empty window in front).
+_BLANK_TAB_URLS = ("about:blank", "edge://newtab", "data:,")
+
+
 def _find_or_open_tab(driver, url: str) -> None:
-    """Switch to existing tab on the same origin as url; open a new tab if absent."""
+    """Switch to existing tab on the same origin as url; open a new tab if absent.
+
+    A leftover blank/new-tab tab (Edge starts on about:blank) is NAVIGATED to
+    the target URL instead of spawning an extra tab, so the automation window
+    shows the real page rather than an empty about:blank tab in front."""
     from urllib.parse import urlparse
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
+    blank_handle = None
     for handle in driver.window_handles:
         try:
             driver.switch_to.window(handle)
-            if driver.current_url.startswith(origin):
-                return
+            cur = driver.current_url
         except Exception:
             continue
+        if cur.startswith(origin):
+            return
+        if blank_handle is None and any(cur == b or cur.startswith(b) for b in _BLANK_TAB_URLS):
+            blank_handle = handle
+    if blank_handle is not None:
+        try:
+            driver.switch_to.window(blank_handle)
+            driver.get(url)
+            return
+        except Exception:
+            pass
     driver.execute_script("window.open(arguments[0], '_blank');", url)
     driver.switch_to.window(driver.window_handles[-1])
 
@@ -4302,9 +4323,16 @@ class B2BSoftScraper:
             self.log("Company ID submitted.")
             # Wait for the companyId field to go hidden (page transition started)
             # before polling for AccountId — prevents burning 150s on the wrong page.
+            # Landing on sso.b2bsoft.com counts as transitioned — its Step-2
+            # handling below deals with the SSO page's own company-ID stage.
             _trans_deadline = time.time() + 20
             while time.time() < _trans_deadline:
                 try:
+                    try:
+                        if "sso.b2bsoft.com" in (drv.current_url or ""):
+                            break
+                    except Exception:
+                        pass
                     els = drv.find_elements(By.ID, "companyId")
                     if not els or not els[0].is_displayed():
                         break
@@ -4325,6 +4353,7 @@ class B2BSoftScraper:
             account_el = None
             username_seen = False
             last_diag = 0.0
+            sso_submits = 0
             while time.time() < deadline:
                 if stop_event is not None and stop_event.is_set():
                     raise RuntimeError("Cancelled by stop event.")
@@ -4350,6 +4379,28 @@ class B2BSoftScraper:
                             username_seen = True
                             self.log("No Account ID field on this page — going straight to Username.")
                             break
+                    except Exception:
+                        pass
+                # SSO company-ID stage: the login page shows ONLY #companyId
+                # (+ Edit/Clear/Next buttons) — type the company ID and click
+                # Next so the Account/Username/Password fields appear.
+                comp = drv.find_elements(By.ID, "companyId")
+                if comp and sso_submits < 3:
+                    try:
+                        if comp[0].is_displayed():
+                            try:
+                                cur_val = (comp[0].get_attribute("value") or "").strip()
+                            except Exception:
+                                cur_val = ""
+                            if cur_val != (self.company_id or "").strip():
+                                _robust_type(comp[0], self.company_id)
+                            btns = drv.find_elements(By.ID, "btnSubmit")
+                            if btns:
+                                _js_click(btns[0])
+                                sso_submits += 1
+                                self.log(f"SSO company-ID page — company ID submitted (attempt {sso_submits}).")
+                                time.sleep(2)
+                                continue
                     except Exception:
                         pass
                 now = time.time()
@@ -5923,24 +5974,29 @@ class GFHApp(tk.Tk):
         The monitor only disables itself if an install genuinely failed.
         """
         global pytesseract, PYTESSERACT_AVAILABLE
-        self._log_scheduler("👁 WhatsApp OCR monitor started.")
+
+        def _olog(m):
+            # Thread-safe: this entry runs on the WhatsAppOCR background thread;
+            # tkinter widgets must only be touched on the main thread.
+            self.after(0, lambda mm=str(m): self._log_scheduler(mm))
+
+        _olog("👁 WhatsApp OCR monitor started.")
         if not _is_tesseract_installed():
-            self._log_scheduler("👁 Tesseract OCR not found — installing automatically…")
-            ok = _install_tesseract_binary(lambda m: self._log_scheduler(f"👁 {m}"))
+            _olog("👁 Tesseract OCR not found — installing automatically…")
+            ok = _install_tesseract_binary(lambda m: _olog(f"👁 {m}"))
             if not ok:
-                self.after(0, lambda: self._log_scheduler(
-                    "⚠ Tesseract OCR binary not found and auto-install failed — OCR monitor disabled. "
-                    "Install from https://github.com/UB-Mannheim/tesseract/wiki"))
+                _olog("⚠ Tesseract OCR binary not found and auto-install failed — OCR monitor disabled. "
+                      "Install from https://github.com/UB-Mannheim/tesseract/wiki")
                 self._wa_ocr_running = False
                 return
             _refresh_tesseract_path()
-            self._log_scheduler("👁 Tesseract ready — OCR monitor active.")
+            _olog("👁 Tesseract ready — OCR monitor active.")
         if not PYTESSERACT_AVAILABLE:
             # Running from source: try pip install once (frozen EXE bundles it).
             pip = _pip_cmd()
             installed = False
             if pip:
-                self._log_scheduler("👁 Installing pytesseract package…")
+                _olog("👁 Installing pytesseract package…")
                 ok, _out = _run_cmd_quiet(pip + ["install", "--quiet", "pytesseract"], timeout=600)
                 installed = ok
                 if installed:
@@ -5952,9 +6008,8 @@ class GFHApp(tk.Tk):
                     except Exception:
                         installed = False
             if not installed:
-                self.after(0, lambda: self._log_scheduler(
-                    "⚠ pytesseract Python package not available — OCR monitor disabled. "
-                    "Run: pip install pytesseract"))
+                _olog("⚠ pytesseract Python package not available — OCR monitor disabled. "
+                      "Run: pip install pytesseract")
                 self._wa_ocr_running = False
                 return
         self._whatsapp_ocr_loop()
