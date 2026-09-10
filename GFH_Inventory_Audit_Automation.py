@@ -4915,10 +4915,94 @@ class B2BSoftScraper:
             self.log("Report tree item not found — using current view")
             return False
 
+    def _select_date_range_today(self) -> None:
+        """Select 'Today' in the report's TomSelect date-range dropdown.
+
+        The Inventory Count Result Details page defaults the dropdown to
+        'Month to Date' (user HTML: div.ts-control#tomselect-1-ts-control,
+        item data-value="0"; the dropdown option data-value="2" is Today).
+        Exporting without switching produces a month-to-date file
+        (Inventory_Count_Result_Details_09012026-09102026.Xlsx) instead of
+        today's counts. Primary route: the TomSelect JS API (setValue —
+        fires the change event the report grid listens to). Fallback: open
+        the dropdown and click the visible 'Today' option.
+        """
+        from selenium.webdriver.common.by import By
+        js_set_today = """
+            var candidates = [];
+            document.querySelectorAll('select').forEach(function(s) {
+                var ts = s.tomselect;
+                if (!ts) return;
+                var hasToday = false, hasM2D = false;
+                Object.keys(ts.options || {}).forEach(function(k) {
+                    var t = ((ts.options[k] && ts.options[k].text) + '').trim().toLowerCase();
+                    if (t === 'today') hasToday = true;
+                    if (t.indexOf('month to date') >= 0) hasM2D = true;
+                });
+                if (hasToday) candidates.push({ts: ts, m2d: hasM2D});
+            });
+            if (!candidates.length) return 'no-ts';
+            candidates.sort(function(a, b) { return (b.m2d ? 1 : 0) - (a.m2d ? 1 : 0); });
+            var sel = candidates[0].ts;
+            var chosen = null;
+            Object.keys(sel.options).forEach(function(k) {
+                var o = sel.options[k];
+                if (o && ((o.text || '') + '').trim().toLowerCase() === 'today') chosen = o;
+            });
+            if (!chosen) return 'no-option';
+            if ((sel.getValue() + '') === (chosen.value + '')) return 'already';
+            sel.setValue(chosen.value);
+            var item = sel.wrapper ? sel.wrapper.querySelector('.item') : null;
+            return 'set:' + (item ? (item.textContent || '').trim() : chosen.value);
+        """
+        result = ""
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                result = str(drv.execute_script(js_set_today) or "")
+            except Exception:
+                result = ""
+            if result and result != "no-ts":
+                break
+            time.sleep(0.5)
+        if result.startswith("set:"):
+            self.log(f"✓ Date-range dropdown set to 'Today' ({result}).")
+        elif result == "already":
+            self.log("Date-range dropdown already on 'Today'.")
+        else:
+            # UI fallback: click the ts-control to open the dropdown, then
+            # click the visible 'Today' option (data-value="2" in the real
+            # markup).
+            try:
+                ctrl = drv.find_element(By.CSS_SELECTOR, ".ts-control")
+                drv.execute_script("arguments[0].click();", ctrl)
+                time.sleep(0.8)
+                clicked = False
+                for opt in drv.find_elements(By.CSS_SELECTOR,
+                        ".ts-dropdown .option, [id*='ts-dropdown'] .option"):
+                    if "today" in (opt.text or "").strip().lower():
+                        drv.execute_script("arguments[0].click();", opt)
+                        clicked = True
+                        break
+                if clicked:
+                    self.log("✓ Date-range dropdown set to 'Today' (UI click).")
+                else:
+                    self.log("⚠ 'Today' option not found in the date-range dropdown — exporting with the current range.")
+            except Exception:
+                self.log("⚠ No date-range dropdown found — exporting with the current range.")
+
     def download_xlsx(self, timeout: int = 45) -> Optional[Path]:
         """Try to trigger an XLSX download and return the file path."""
         from selenium.webdriver.common.by import By
-        existing = set(self.download_dir.glob("*.xlsx"))
+        # Switch the report's date-range dropdown from 'Month to Date' to
+        # 'Today' BEFORE triggering any export — the export honors whatever
+        # range is currently selected.
+        self._select_date_range_today()
+        # Snapshot name → mtime: the scheduler re-exports the same file name
+        # every cycle, so a re-download must be detected by mtime, not by a
+        # new file name.
+        existing = {p: p.stat().st_mtime for p in self.download_dir.glob("*.xlsx")}
+        _export_started = time.time()
         # Try visible export/download buttons
         try:
             for text in ["count sheet", "countsheet", "download", "export", "xlsx", "excel"]:
@@ -4948,14 +5032,18 @@ class B2BSoftScraper:
                 time.sleep(5)
         except Exception:
             pass
-        # Wait for file
+        # Wait for file — a new name OR the same name rewritten with a fresh
+        # mtime (the scheduler exports the same file name on every cycle).
         deadline = time.time() + timeout
         while time.time() < deadline:
-            new_files = set(self.download_dir.glob("*.xlsx")) - existing
-            if new_files:
-                f = max(new_files, key=lambda p: p.stat().st_mtime)
-                self.log(f"✓ Downloaded: {f.name}")
-                return f
+            for p in self.download_dir.glob("*.xlsx"):
+                try:
+                    mtime = p.stat().st_mtime
+                except Exception:
+                    continue
+                if p not in existing or mtime > _export_started - 1:
+                    self.log(f"✓ Downloaded: {p.name}")
+                    return p
             time.sleep(1)
         self.log("No XLSX download detected within timeout")
         return None
@@ -5088,7 +5176,10 @@ class TimesheetScraper:
         else:
             time.sleep(2)  # let SPA finish rendering after tab switch
 
-        existing = set(self.download_dir.glob("*.xlsx"))
+        # Snapshot name → mtime: the timesheet export writes the same file
+        # name on every cycle, so a re-download must be detected by mtime.
+        existing = {p: p.stat().st_mtime for p in self.download_dir.glob("*.xlsx")}
+        _export_started = time.time()
 
         # Click "Today" date filter button — try up to 3 times (SPA may still render)
         _today_xpaths = [
@@ -5149,11 +5240,14 @@ class TimesheetScraper:
 
         deadline = time.time() + timeout
         while time.time() < deadline:
-            new_files = set(self.download_dir.glob("*.xlsx")) - existing
-            if new_files:
-                f = max(new_files, key=lambda p: p.stat().st_mtime)
-                self.log(f"✓ Timesheet downloaded: {f.name}")
-                return f
+            for p in self.download_dir.glob("*.xlsx"):
+                try:
+                    mtime = p.stat().st_mtime
+                except Exception:
+                    continue
+                if p not in existing or mtime > _export_started - 1:
+                    self.log(f"✓ Timesheet downloaded: {p.name}")
+                    return p
             time.sleep(1)
         self.log("No timesheet XLSX downloaded within timeout")
         return None
@@ -6187,8 +6281,12 @@ class GFHApp(tk.Tk):
                 _run_ts()
             except Exception as exc:
                 self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
-
-                # Reload variances and optionally send variance image
+            finally:
+                # Reload variances and optionally send variance image — must
+                # run on EVERY cycle. This block used to sit inside the except
+                # handler, and _run_b2b/_run_ts swallow their own errors, so on
+                # a normal successful export load_variances() never ran and the
+                # Status tab stayed empty until a manual Load Variances click.
                 _district_for_send = district
                 def _reload_and_send():
                     try:
@@ -6237,9 +6335,6 @@ class GFHApp(tk.Tk):
                     except Exception as exc:
                         self._log_scheduler(f"⚠ Reload error: {exc}")
                 self.after(0, _reload_and_send)
-            except Exception as exc:
-                self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
-            finally:
                 _lock = getattr(self, "_export_cycle_lock", None)
                 if _lock is not None:
                     try:
