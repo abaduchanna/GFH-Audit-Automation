@@ -52,6 +52,7 @@ def _auto_install_packages() -> None:
         ("openpyxl",    "openpyxl"),
         ("pyautogui",   "pyautogui"),
         ("pyperclip",   "pyperclip"),
+        ("pytesseract", "pytesseract"),
         ("win32api",    "pywin32"),
         ("pygetwindow", "pygetwindow"),
     ]
@@ -3859,6 +3860,24 @@ _TESSERACT_CANDIDATES = [
 _GHOSTSCRIPT_EXES = ("gswin64c", "gswin32c", "gswin64", "gswin32", "gs")
 
 
+# ── OCR dependency detection (same pattern as VidaPay Transfer Bot) ─────────
+# pytesseract is imported at MODULE LEVEL so PyInstaller bundles it into the
+# frozen EXE (a lazy import inside a function can be missed when the package
+# is absent from the build environment). Detection uses the module-level flag.
+try:
+    import pytesseract
+    PYTESSERACT_AVAILABLE = True
+except Exception:
+    pytesseract = None
+    PYTESSERACT_AVAILABLE = False
+
+# Tesseract silent installer fallback (UB-Mannheim build, same as Transfer Bot)
+_OCR_TESSERACT_URL = (
+    "https://digi.bib.uni-mannheim.de/tesseract/"
+    "tesseract-ocr-w64-setup-5.3.3.20231005.exe"
+)
+
+
 def _is_tesseract_installed() -> bool:
     if shutil.which("tesseract"):
         return True
@@ -3871,6 +3890,88 @@ def _locate_tesseract() -> str:
             return p
     found = shutil.which("tesseract")
     return found if found else _TESSERACT_CANDIDATES[0]
+
+
+if PYTESSERACT_AVAILABLE:
+    # Point pytesseract at the best known tesseract.exe right away
+    # (Transfer Bot does this at module level too).
+    pytesseract.pytesseract.tesseract_cmd = _locate_tesseract()
+
+
+def _tool_on_path(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def _run_cmd_quiet(cmd, timeout: float = 300):
+    """Run a command and return (ok, output). Never raises."""
+    try:
+        import subprocess as _sp
+        proc = _sp.run(cmd, capture_output=True, text=True, timeout=timeout)
+        output = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        return proc.returncode == 0, output
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _download_file(url: str, dest: str, log=print, timeout: float = 240) -> bool:
+    """Download url to dest (Transfer Bot helper). Returns True on success."""
+    try:
+        import urllib.request as _urlreq
+        log(f"Downloading {os.path.basename(url)} ...")
+        req = _urlreq.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with _urlreq.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        return os.path.isfile(dest) and os.path.getsize(dest) > 0
+    except Exception as exc:
+        log(f"Download failed: {exc}")
+        return False
+
+
+def _pip_cmd():
+    """Return a pip command usable in this Python, even inside a frozen
+    PyInstaller exe where sys.executable points at the exe itself."""
+    if getattr(sys, "frozen", False):
+        for cand in ("python", "python3", "py"):
+            found = shutil.which(cand)
+            if found:
+                return [found, "-m", "pip"]
+        return None
+    return [sys.executable, "-m", "pip"]
+
+
+def _refresh_tesseract_path() -> None:
+    """Re-point pytesseract at the best tesseract.exe after an install."""
+    if PYTESSERACT_AVAILABLE:
+        pytesseract.pytesseract.tesseract_cmd = _locate_tesseract()
+
+
+def _install_tesseract_binary(log=print) -> bool:
+    """Install the Tesseract OCR binary automatically (VidaPay Transfer Bot approach):
+    winget first, then the official silent installer as fallback."""
+    if _is_tesseract_installed():
+        return True
+    if _tool_on_path("winget"):
+        log("Installing Tesseract OCR via winget…")
+        _run_cmd_quiet(
+            ["winget", "install", "--id", "UB-Mannheim.TesseractOCR", "-e",
+             "--accept-source-agreements", "--accept-package-agreements", "--silent"],
+            timeout=600,
+        )
+        if _is_tesseract_installed():
+            log("Tesseract installed via winget.")
+            return True
+    installer = os.path.join(APP_DIR, "tesseract-setup.exe")
+    if _download_file(_OCR_TESSERACT_URL, installer, log):
+        log("Running Tesseract silent installer (this can take a minute)…")
+        _run_cmd_quiet([installer, "/S"], timeout=900)
+        try:
+            os.remove(installer)
+        except Exception:
+            pass
+        if _is_tesseract_installed():
+            log("Tesseract installed from official installer.")
+            return True
+    return False
 
 
 def _ghostscript_installed() -> bool:
@@ -3972,14 +4073,34 @@ def _find_or_open_tab(driver, url: str) -> None:
     driver.switch_to.window(driver.window_handles[-1])
 
 
-def open_monitoring_tabs(port: int = EDGE_DEBUG_PORT) -> None:
-    """Open WhatsApp, B2B, GFH app tabs in Edge at debug port (call once on scheduler start)."""
+def _humanize_list(items: list) -> str:
+    """['B2B', 'GFH app', 'WhatsApp Web'] -> 'B2B, GFH app, and WhatsApp Web'."""
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    return ", ".join(items[:-1]) + ", and " + items[-1]
+
+
+def open_monitoring_tabs(port: int = EDGE_DEBUG_PORT, include_whatsapp: bool = True) -> list:
+    """Open B2B, GFH app (and optionally WhatsApp Web) tabs in Edge at debug port.
+
+    Returns the list of tab names that are now open. WhatsApp Web is only
+    opened when include_whatsapp is True (i.e. WhatsApp Web mode is selected);
+    with WhatsApp Desktop mode only B2B and GFH app tabs are opened.
+    """
+    opened: list = []
     try:
         driver = _edge_debug_driver(port)
-        for url in (_WA_URL, _B2B_URL, _GFH_APP_URL):
+        for url, name in ((_B2B_URL, "B2B"), (_GFH_APP_URL, "GFH app")):
             _find_or_open_tab(driver, url)
+            opened.append(name)
+        if include_whatsapp:
+            _find_or_open_tab(driver, _WA_URL)
+            opened.append("WhatsApp Web")
     except Exception:
         pass
+    return opened
 
 
 # B2B Soft Scraper (wsreports.b2bsoft.com)
@@ -4006,7 +4127,15 @@ class B2BSoftScraper:
         self.username = username
         self.password = password
         self.download_dir = Path(download_dir)
-        self.log = log_fn or (lambda m: None)
+        _base_log = log_fn or (lambda m: None)
+
+        def _log_no_double_prefix(m):
+            # log_fn already prepends "[B2B] " — strip hardcoded copies from
+            # messages so the scheduler log never shows "[B2B] [B2B] ...".
+            m = str(m)
+            _base_log(m[len("[B2B] "):] if m.startswith("[B2B] ") else m)
+
+        self.log = _log_no_double_prefix
         self.driver = None
 
     def _make_driver(self):
@@ -4061,8 +4190,8 @@ class B2BSoftScraper:
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
 
-        if not all([self.company_id, self.account_id, self.username, self.password]):
-            raise RuntimeError("B2B credentials incomplete — fill Portal Credentials tab.")
+        if not all([self.company_id, self.username, self.password]):
+            raise RuntimeError("B2B credentials incomplete — fill Portal Credentials tab (Account ID is optional).")
         if self.driver is None:
             self._make_driver()
         self.download_dir.mkdir(parents=True, exist_ok=True)
@@ -4112,6 +4241,24 @@ class B2BSoftScraper:
             except Exception:
                 drv.execute_script("arguments[0].click();", element)
 
+        def _visible_fields_snapshot():
+            """List visible input/button identifiers on the page (diagnostics)."""
+            try:
+                return drv.execute_script("""
+                    const out = [];
+                    document.querySelectorAll('input, button').forEach(el => {
+                        const r = el.getBoundingClientRect();
+                        if (r.width > 0 && r.height > 0) {
+                            out.push((el.id ? '#' + el.id : '')
+                                + (el.name ? '[name=' + el.name + ']' : '')
+                                + (el.type && el.type !== 'text' ? '[' + el.type + ']' : ''));
+                        }
+                    });
+                    return out.slice(0, 20);
+                """)
+            except Exception:
+                return []
+
         def _wait_for_field_or_verify(field_id: str, label: str, timeout: int = 60):
             """Wait for a login-form field to appear, clearing any Cloudflare that blocks it."""
             deadline = time.time() + timeout
@@ -4138,6 +4285,9 @@ class B2BSoftScraper:
                     except Exception:
                         url = "unknown"
                     self.log(f"[B2B] Waiting for {label} ({elapsed}s elapsed, on {url})")
+                    _fields = _visible_fields_snapshot()
+                    if _fields:
+                        self.log(f"[B2B] Visible fields on page: {', '.join(_fields)}")
                     last_status_log = now
                 time.sleep(0.5)
             raise RuntimeError(f"B2B field #{field_id} ({label}) not visible after {timeout}s.")
@@ -4164,12 +4314,72 @@ class B2BSoftScraper:
         except Exception as e:
             raise RuntimeError(f"B2B Step 1 (Company ID) failed: {e}")
 
-        # ── Step 2: Account ID — wait with Cloudflare awareness ────────────
+        # ── Step 2: Account ID — adaptive wait (fixes the SSO stall) ────────
+        # The SSO login page (sso.b2bsoft.com/account/login) may show an
+        # Account ID field — or may only show Username + Password (company ID
+        # carried by the SSO session). Poll for all candidates at once, type
+        # whatever actually appears, and log the page's visible fields every
+        # 15s so any future stall is explained directly in the log.
         try:
-            f = _wait_for_field_or_verify("AccountId", "Account ID", timeout=150)
-            _robust_type(f, self.account_id)
-            self.log(f"Account ID entered: {self.account_id}")
-            time.sleep(1)
+            deadline = time.time() + 150
+            account_el = None
+            username_seen = False
+            last_diag = 0.0
+            while time.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("Cancelled by stop event.")
+                if _b2b_is_human_verification_page(drv):
+                    self.log("Cloudflare detected before Account ID — waiting to clear…")
+                    if not _b2b_wait_for_human_verification_clear(drv, stop_event=stop_event, log=self.log):
+                        raise RuntimeError("Cloudflare not resolved before Account ID.")
+                # Account ID field present and visible? → use it.
+                acc = drv.find_elements(By.ID, "AccountId")
+                if acc:
+                    try:
+                        if acc[0].is_displayed():
+                            account_el = acc[0]
+                            break
+                    except Exception:
+                        pass
+                # Username already visible without AccountId? → SSO page has
+                # no Account ID step; skip straight to Username + Password.
+                usr = drv.find_elements(By.ID, "Username")
+                if usr:
+                    try:
+                        if usr[0].is_displayed():
+                            username_seen = True
+                            self.log("No Account ID field on this page — going straight to Username.")
+                            break
+                    except Exception:
+                        pass
+                now = time.time()
+                if now - last_diag >= 15:
+                    elapsed = int(now - (deadline - 150))
+                    try:
+                        url = drv.current_url
+                    except Exception:
+                        url = "unknown"
+                    self.log(f"Waiting for Account ID ({elapsed}s elapsed, on {url})")
+                    fields = _visible_fields_snapshot()
+                    if fields:
+                        self.log(f"Visible fields on page: {', '.join(fields)}")
+                    last_diag = now
+                time.sleep(0.5)
+            if account_el is not None:
+                if (self.account_id or "").strip():
+                    _robust_type(account_el, self.account_id)
+                    self.log(f"Account ID entered: {self.account_id}")
+                else:
+                    self.log("Account ID field found but no Account ID saved — leaving it empty.")
+                time.sleep(1)
+            elif not username_seen:
+                fields = _visible_fields_snapshot()
+                raise RuntimeError(
+                    "B2B Account ID step failed: neither AccountId nor Username appeared within 150s. "
+                    + ("Visible fields: " + ", ".join(fields) if fields else "No visible input fields on page.")
+                )
+        except RuntimeError:
+            raise
         except Exception as e:
             raise RuntimeError(f"B2B Step 2 (Account ID) failed: {e}")
 
@@ -5383,7 +5593,9 @@ class GFHApp(tk.Tk):
             ready = _ensure_edge_open(log=_log)
             if ready:
                 _log("✓ Edge ready at port 9227.")
-                open_monitoring_tabs()
+                names = self._sched_open_tabs()
+                if names:
+                    _log("Opened " + _humanize_list(names) + " tabs.")
             else:
                 _log("⚠ Could not open Edge at port 9227.")
             self._scheduler_run_export_cycle()
@@ -5435,6 +5647,16 @@ class GFHApp(tk.Tk):
         if fired_set is not None:
             fired_set.add(district)
 
+    def _sched_open_tabs(self) -> list:
+        """Open scheduler tabs in the automation Edge window: B2B, GFH app, and
+        WhatsApp Web (only when WhatsApp Web mode is selected). Returns opened names."""
+        try:
+            mode_var = getattr(self, "wa_mode_var", None)
+            include_wa = (mode_var.get() == "web") if mode_var is not None else True
+        except Exception:
+            include_wa = True
+        return open_monitoring_tabs(include_whatsapp=include_wa)
+
     def _scheduler_run_export_cycle(self, district: str = None) -> None:
         """Export B2B + Timesheet files, reload variances, optionally send variance image."""
         lock = getattr(self, "_export_cycle_lock", None)
@@ -5443,12 +5665,13 @@ class GFHApp(tk.Tk):
             return
         self._log_scheduler("⟳ Running export cycle…")
         def _run():
-            # Pre-open separate tabs for B2B and TS so each scraper gets its own tab.
+            # Pre-open separate tabs so each scraper gets its own tab (and a
+            # WhatsApp Web tab when WhatsApp Web mode is selected).
             try:
-                _pre_driver = _edge_debug_driver()
-                _find_or_open_tab(_pre_driver, _B2B_URL)
-                _find_or_open_tab(_pre_driver, _GFH_APP_URL)
-                self.after(0, lambda: self._log_scheduler("Opened B2B and TS tabs."))
+                names = self._sched_open_tabs()
+                if names:
+                    self.after(0, lambda n=list(names): self._log_scheduler(
+                        "Opened " + _humanize_list(n) + " tabs."))
             except Exception:
                 pass
 
@@ -5688,26 +5911,60 @@ class GFHApp(tk.Tk):
         if getattr(self, "_wa_ocr_running", False):
             return
         self._wa_ocr_running = True
-        threading.Thread(target=self._whatsapp_ocr_loop, daemon=True, name="WhatsAppOCR").start()
+        threading.Thread(target=self._whatsapp_ocr_entry, daemon=True, name="WhatsAppOCR").start()
+
+    def _whatsapp_ocr_entry(self) -> None:
+        """OCR dependency auto-setup (VidaPay Transfer Bot style), then the monitor loop.
+
+        Missing pieces are INSTALLED automatically instead of disabling the monitor:
+        - Tesseract binary absent  -> winget, then the official silent installer.
+        - pytesseract package      -> bundled in the frozen EXE (module-level import);
+                                      auto-pip-installed when running from source.
+        The monitor only disables itself if an install genuinely failed.
+        """
+        global pytesseract, PYTESSERACT_AVAILABLE
         self._log_scheduler("👁 WhatsApp OCR monitor started.")
+        if not _is_tesseract_installed():
+            self._log_scheduler("👁 Tesseract OCR not found — installing automatically…")
+            ok = _install_tesseract_binary(lambda m: self._log_scheduler(f"👁 {m}"))
+            if not ok:
+                self.after(0, lambda: self._log_scheduler(
+                    "⚠ Tesseract OCR binary not found and auto-install failed — OCR monitor disabled. "
+                    "Install from https://github.com/UB-Mannheim/tesseract/wiki"))
+                self._wa_ocr_running = False
+                return
+            _refresh_tesseract_path()
+            self._log_scheduler("👁 Tesseract ready — OCR monitor active.")
+        if not PYTESSERACT_AVAILABLE:
+            # Running from source: try pip install once (frozen EXE bundles it).
+            pip = _pip_cmd()
+            installed = False
+            if pip:
+                self._log_scheduler("👁 Installing pytesseract package…")
+                ok, _out = _run_cmd_quiet(pip + ["install", "--quiet", "pytesseract"], timeout=600)
+                installed = ok
+                if installed:
+                    try:
+                        import importlib as _imp
+                        pytesseract = _imp.import_module("pytesseract")
+                        PYTESSERACT_AVAILABLE = True
+                        _refresh_tesseract_path()
+                    except Exception:
+                        installed = False
+            if not installed:
+                self.after(0, lambda: self._log_scheduler(
+                    "⚠ pytesseract Python package not available — OCR monitor disabled. "
+                    "Run: pip install pytesseract"))
+                self._wa_ocr_running = False
+                return
+        self._whatsapp_ocr_loop()
 
     def _whatsapp_ocr_loop(self) -> None:
-        """Continuously grab the screen area where WhatsApp notifications appear and read IMEIs."""
+        """Continuously grab the screen area where WhatsApp notifications appear and read IMEIs.
+        Dependency checks/auto-install happen in _whatsapp_ocr_entry."""
         import re as _re
         import datetime as _dt
-        if not _is_tesseract_installed():
-            self.after(0, lambda: self._log_scheduler(
-                "⚠ Tesseract OCR binary not found — OCR monitor disabled. "
-                "Install from https://github.com/UB-Mannheim/tesseract/wiki"))
-            self._wa_ocr_running = False
-            return
-        try:
-            import pytesseract
-            pytesseract.pytesseract.tesseract_cmd = _locate_tesseract()
-        except ImportError:
-            self.after(0, lambda: self._log_scheduler(
-                "⚠ pytesseract Python package not installed — OCR monitor disabled. "
-                "Run: pip install pytesseract"))
+        if not (PYTESSERACT_AVAILABLE and pytesseract is not None):
             self._wa_ocr_running = False
             return
 
