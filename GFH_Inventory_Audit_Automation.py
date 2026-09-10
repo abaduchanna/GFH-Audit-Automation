@@ -3432,6 +3432,8 @@ class B2BSoftScraper:
         if self.driver is None:
             self._make_driver()
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        # Switch to B2B tab before navigating — prevents overwriting another scraper's tab.
+        _find_or_open_tab(self.driver, self.PORTAL_URL)
         self.log(f"Opening {self.PORTAL_URL}")
         self.driver.get(self.PORTAL_URL)
         time.sleep(2)
@@ -3526,7 +3528,15 @@ class B2BSoftScraper:
                     continue
             if not clicked:
                 self.log("Warning: no login button found after credentials.")
-            time.sleep(3)
+            # Wait for URL change (page navigates away from login) — mirrors VidaPay.
+            old_url = drv.current_url
+            try:
+                from selenium.webdriver.support.ui import WebDriverWait as _WDW
+                _WDW(drv, 15).until(lambda d: d.current_url != old_url)
+                self.log("URL changed after login.")
+            except Exception:
+                self.log("URL did not change after login click — continuing.")
+            time.sleep(2)
         except Exception as e:
             raise RuntimeError(f"B2B Step 3 (Username/Password) failed: {e}")
 
@@ -3556,12 +3566,26 @@ class B2BSoftScraper:
     def _is_authed(self) -> bool:
         from selenium.webdriver.common.by import By
         try:
+            # Still on login form → not authed
             if self.driver.find_elements(By.ID, "companyId"):
+                return False
+            if self.driver.find_elements(By.ID, "AccountId"):
                 return False
             if self.driver.find_elements(By.ID, "Username"):
                 return False
-            return bool(self.driver.find_elements(By.CSS_SELECTOR,
-                "table, .x-panel, #reportGrid, .report, main, #root"))
+            if self.driver.find_elements(By.ID, "btnSubmit"):
+                return False
+            if self.driver.find_elements(By.ID, "btnClick"):
+                return False
+            # URL left the login origin path or page has any content → authed
+            url = self.driver.current_url.lower()
+            if "wsreports.b2bsoft.com" not in url:
+                return False
+            body_text = (self.driver.find_element(By.TAG_NAME, "body").text or "").lower()
+            if "new sign in" in body_text or "2-factor" in body_text:
+                return False
+            # No login fields present and on B2B domain → treat as authenticated
+            return True
         except Exception:
             return False
 
@@ -3696,6 +3720,8 @@ class TimesheetScraper:
         if self.driver is None:
             self._make_driver()
         self.download_dir.mkdir(parents=True, exist_ok=True)
+        # Switch to TS tab before navigating — prevents overwriting B2B tab.
+        _find_or_open_tab(self.driver, self.PORTAL_URL)
         self.log(f"Opening {self.PORTAL_URL}")
         self.driver.get(self.PORTAL_URL)
         time.sleep(3)
@@ -3724,6 +3750,13 @@ class TimesheetScraper:
         from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
+
+        # Ensure we are on the TS tab (B2B may have been active).
+        _find_or_open_tab(self.driver, self.PORTAL_URL)
+        # Navigate to timesheet route explicitly in case login redirected elsewhere.
+        if not self.driver.current_url.startswith("https://gfh-telecom-app.web.app/timesheet"):
+            self.driver.get(self.PORTAL_URL)
+            time.sleep(3)
 
         existing = set(self.download_dir.glob("*.xlsx"))
 
