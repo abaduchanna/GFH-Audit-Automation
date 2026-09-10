@@ -4667,14 +4667,16 @@ class B2BSoftScraper:
                                 except Exception:
                                     submit_val = val
                                 sso_submits += 1
-                                # Rotation: real click → ENTER → requestSubmit
-                                # (keeps button=continue + native validation) →
-                                # raw form.submit() (bypasses any broken JS
-                                # submit handler). Edit is NOT a strategy: this
-                                # page's #btnCompanyIdEdit only focuses the
-                                # field — the readonly pre-step above already
-                                # clicks it when the field is genuinely locked.
-                                strategy = ("submit", "enter", "rsubmit", "formsubmit")[sso_submits - 1]
+                                # Rotation order — measured on the live
+                                # page (16:23 scheduler log): the #btnSubmit
+                                # click and ENTER both produced "submit/
+                                # network activity: NONE" while form
+                                # .requestSubmit() POSTed to /Account/
+                                # LoginCompany and advanced. So requestSubmit
+                                # goes FIRST — it keeps native validation and
+                                # the button=continue submitter value; the
+                                # click / ENTER / raw-submit stay as fallbacks.
+                                strategy = ("rsubmit", "submit", "enter", "formsubmit")[sso_submits - 1]
                                 if strategy == "enter":
                                     from selenium.webdriver.common.keys import Keys as _Keys
                                     comp[0].send_keys(_Keys.RETURN)
@@ -4812,7 +4814,7 @@ class B2BSoftScraper:
                     _fields = _visible_fields_snapshot()
                     raise RuntimeError(
                         "B2B login stalled on the SSO 'Access Code' page — tried 4 times "
-                        "(Submit → Enter → requestSubmit → form.submit) without the page advancing. "
+                        "(requestSubmit → Submit → Enter → form.submit) without the page advancing. "
                         "The log lines above show the exact field value at every submit "
                         "attempt plus any page error text. Verify the Company ID on the "
                         "Portal Credentials tab (it doubles as the Access Code) and retry. "
@@ -4921,21 +4923,112 @@ class B2BSoftScraper:
             # Same button-matching chain as vidapay-extractor: the SSO
             # sign-in button is force-enabled and clicked via JS (native
             # click first, MouseEvent fallback). "Next" first — that is the
-            # button the SSO sign-in page actually shows.
+            # button the SSO sign-in page actually shows. Waits are short:
+            # the generic password-form submit below covers anything these
+            # miss, so a wrong guess no longer burns half a minute.
             for _btn_label, kwargs in [
-                ("#btnClick verify button", {"button_id": "btnClick", "timeout": 6}),
-                ("Next button", {"text_contains": "next", "timeout": 8}),
-                ("Sign In button", {"text_contains": "sign in", "timeout": 6}),
-                ("Log In button", {"text_contains": "log in", "timeout": 4}),
-                ("Login button", {"text_contains": "login", "timeout": 4}),
-                ("Continue button", {"text_contains": "continue", "timeout": 4}),
+                ("#btnClick verify button", {"button_id": "btnClick", "timeout": 4}),
+                ("Next button", {"text_contains": "next", "timeout": 2}),
+                ("Sign In button", {"text_contains": "sign in", "timeout": 2}),
+                ("Log In button", {"text_contains": "log in", "timeout": 2}),
+                ("Login button", {"text_contains": "login", "timeout": 2}),
+                ("Continue button", {"text_contains": "continue", "timeout": 2}),
             ]:
                 if _b2b_click_button(drv, label=_btn_label, log=self.log, **kwargs):
                     return True
+            # None of the known buttons matched (16:24 scheduler log: six
+            # searches + input[type=submit] all missed while Account ID /
+            # Username / Password were filled). The SSO credentials page
+            # can render its submit button DISABLED until its JS validates
+            # the typed fields — and _b2b_click_button skips disabled
+            # controls — so the real button may be sitting right there
+            # unmatchable. Log exactly which controls ARE on the page, then
+            # submit the credentials form directly: force-enable every
+            # submit control inside the password field's form and click the
+            # best one, falling back to form.requestSubmit().
             try:
-                btn = drv.find_element(By.XPATH, "//input[@type='submit']")
-                _js_click(btn)
-                self.log("Clicked input[type=submit].")
+                inv = drv.execute_script("""
+                    const vis = el => { const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0; };
+                    const btns = Array.from(document.querySelectorAll(
+                        'button, input[type=submit], input[type=button]'))
+                        .map(b => ({
+                            tag: b.tagName.toLowerCase(),
+                            id: b.id || null,
+                            type: b.getAttribute('type') || null,
+                            text: ((b.innerText || b.value || '') + '').trim().slice(0, 30),
+                            disabled: !!b.disabled,
+                            visible: vis(b)
+                        }));
+                    const pass = Array.prototype.find.call(
+                        document.querySelectorAll('input[type=password]'), vis);
+                    return {btns: btns.slice(0, 10), hasPassword: !!pass,
+                            formAction: (pass && pass.form)
+                                ? String(pass.form.action || '') : null};
+                """) or {}
+                _parts = ["Password field: " + ("yes" if inv.get("hasPassword") else "NO")]
+                if inv.get("formAction"):
+                    _parts.append("password-form action=" + str(inv.get("formAction")))
+                for _b in (inv.get("btns") or []):
+                    _parts.append(
+                        "<" + str(_b.get("tag"))
+                        + ("#" + str(_b["id"]) if _b.get("id") else "")
+                        + (" type=" + str(_b["type"]) if _b.get("type") else "")
+                        + (" DISABLED" if _b.get("disabled") else "")
+                        + (": '" + str(_b["text"]) + "'" if _b.get("text") else "")
+                        + ("" if _b.get("visible") else " [hidden]") + ">")
+                self.log("SSO credentials page controls: " + " | ".join(_parts))
+            except Exception:
+                pass
+            try:
+                _how = drv.execute_script("""
+                    const vis = el => { if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0; };
+                    const pass = Array.prototype.find.call(
+                        document.querySelectorAll('input[type=password]'), vis);
+                    const form = pass ? (pass.form || pass.closest('form')) : null;
+                    if (!form) return 'nopasswordform';
+                    const cands = Array.from(form.querySelectorAll(
+                        'button, input[type=submit], input[type=button]'));
+                    cands.forEach(function (c) {
+                        c.disabled = false;
+                        c.removeAttribute('aria-disabled');
+                    });
+                    let pick = cands.find(c =>
+                        (c.getAttribute('type') || '').toLowerCase() === 'submit' && vis(c));
+                    if (!pick) pick = cands.find(c => vis(c));
+                    if (pick) {
+                        const desc = '<' + pick.tagName.toLowerCase()
+                            + (pick.id ? '#' + pick.id : '') + '> '
+                            + ((pick.innerText || pick.value || '') + '').trim().slice(0, 30);
+                        pick.scrollIntoView({block: 'center'});
+                        try { pick.focus(); } catch (e) {}
+                        try { pick.click(); return 'clicked ' + desc; }
+                        catch (e) {}
+                        try {
+                            pick.dispatchEvent(new MouseEvent('click',
+                                {bubbles: true, cancelable: true, view: window}));
+                            return 'mouseevent ' + desc;
+                        } catch (e) {}
+                    }
+                    if (form.requestSubmit) { form.requestSubmit(); return 'requestSubmit'; }
+                    form.submit();
+                    return 'form.submit()';
+                """)
+                if _how and _how != "nopasswordform":
+                    self.log(f"SSO credentials submitted via password-form fallback ({_how}).")
+                    return True
+                self.log("SSO password-form fallback: no visible password form found.")
+            except Exception as e:
+                self.log(f"SSO password-form fallback failed: {e}")
+            # Last resort: ENTER inside the password field — the browser's
+            # native implicit-submit path for a credentials form.
+            try:
+                p = drv.find_element(By.XPATH, "//input[@type='password']")
+                from selenium.webdriver.common.keys import Keys as _Keys
+                p.send_keys(_Keys.RETURN)
+                self.log("SSO credentials submitted via ENTER in the password field.")
                 return True
             except Exception:
                 return False
