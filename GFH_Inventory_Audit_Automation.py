@@ -3209,12 +3209,15 @@ _B2B_STATE_VERIFY         = "HUMAN_VERIFY"
 _B2B_STATE_NEW_SIGN       = "NEW_SIGN_IN"
 _B2B_STATE_TWO_FA         = "TWO_FACTOR"
 _B2B_STATE_TRUST_DEVICE   = "TRUST_DEVICE"
+_B2B_STATE_SETUP_NEXT     = "SETUP_NEXT"
+_B2B_STATE_SECURITY_UPG   = "SECURITY_UPGRADE"
 _B2B_STATE_READY_TO_GO    = "READY_TO_GO"
 _B2B_STATE_PORTAL         = "PORTAL"
 _B2B_STATE_UNKNOWN        = "UNKNOWN"
 
 
 def _b2b_get_body(driver) -> str:
+    from selenium.webdriver.common.by import By  # local import — By is not module-level
     try:
         return driver.find_element(By.TAG_NAME, "body").text.lower()
     except Exception:
@@ -3273,7 +3276,9 @@ def _b2b_get_page_state(driver) -> str:
     if "twofactorready" in url or "readytogo" in url:
         return _B2B_STATE_READY_TO_GO
     if "secureupgradeoptions" in url or "securityupgrade" in url:
-        return _B2B_STATE_UNKNOWN  # unsupported upgrade page — wait it out
+        return _B2B_STATE_SECURITY_UPG
+    if "twofactorsetup" in url:
+        return _B2B_STATE_SETUP_NEXT
 
     # ── Heading-based detection (works during SPA partial render) ─────────
     if _b2b_has_heading(driver, "new sign in"):
@@ -3286,6 +3291,16 @@ def _b2b_get_page_state(driver) -> str:
         return _B2B_STATE_TRUST_DEVICE
     if _b2b_has_heading(driver, "ready to go") or _b2b_has_heading(driver, "you're all set"):
         return _B2B_STATE_READY_TO_GO
+    if (_b2b_has_heading(driver, "upgrade security") or
+            _b2b_has_heading(driver, "important: upgrade security")):
+        return _B2B_STATE_SECURITY_UPG
+
+    # Setup-Next pages sit between Trust Device and Ready To Go and carry a
+    # #setupNextBtn button (VidaPay is_twofactor_setup_next_page): any
+    # twofactor.* URL with a Next/setupNextBtn control needs an explicit click,
+    # otherwise the flow stalls until timeout.
+    if "twofactor" in url and _b2b_has_any_setup_next_button(driver):
+        return _B2B_STATE_SETUP_NEXT
 
     # ── body.text fallback (slowest — SPA must have fully rendered) ───────
     body = _b2b_get_body(driver)
@@ -3348,14 +3363,407 @@ def _b2b_click_any_next(driver, log=print) -> bool:
     return False
 
 
-def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 300) -> bool:
-    """State machine for post-login B2B flow — mirrors VidaPay finish_setup_steps.
+def _b2b_click_button(driver, label, text_contains=None, onclick_contains=None,
+                      button_id=None, timeout: int = 25, log=print) -> bool:
+    """Find a usable button by id/text/onclick and click it via JS.
 
-    Handles:
+    Faithful port of VidaPay click_matching_button_js: un-disables the control,
+    scrolls it into view, clicks natively and falls back to a MouseEvent —
+    needed because B2BSoft renders setup controls hidden/disabled in the DOM
+    before they become interactive.
+    """
+    end_time = time.time() + timeout
+    last_log = 0.0
+    while time.time() < end_time:
+        try:
+            clicked = driver.execute_script(
+                """
+                const textContains = (arguments[0] || '').toLowerCase();
+                const onclickContains = (arguments[1] || '').toLowerCase();
+                const buttonId = arguments[2] || '';
+
+                const elements = Array.from(document.querySelectorAll('button, input[type=button], input[type=submit], a'));
+
+                function textOf(el) {
+                    return (el.innerText || el.value || el.textContent || '').trim().toLowerCase();
+                }
+
+                function isUsable(el) {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return (
+                        style.display !== 'none' &&
+                        style.visibility !== 'hidden' &&
+                        style.opacity !== '0' &&
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        el.getClientRects().length > 0 &&
+                        !el.disabled &&
+                        el.getAttribute('aria-disabled') !== 'true'
+                    );
+                }
+
+                const btn = elements.find(el => {
+                    const id = el.id || '';
+                    const onclick = (el.getAttribute('onclick') || '').toLowerCase();
+                    const text = textOf(el);
+                    if (buttonId && id !== buttonId) return false;
+                    if (onclickContains && !onclick.includes(onclickContains)) return false;
+                    if (textContains && !text.includes(textContains)) return false;
+                    return isUsable(el);
+                });
+
+                if (!btn) return false;
+
+                btn.removeAttribute('disabled');
+                btn.disabled = false;
+                btn.removeAttribute('aria-disabled');
+                btn.scrollIntoView({block: 'center'});
+
+                try { btn.focus(); } catch (err) {}
+
+                try {
+                    btn.click();
+                    return true;
+                } catch (err) {
+                    const event = new MouseEvent('click', {bubbles: true, cancelable: true, view: window});
+                    btn.dispatchEvent(event);
+                    return true;
+                }
+                """,
+                text_contains,
+                onclick_contains,
+                button_id,
+            )
+
+            if clicked:
+                log(f"[B2B] Clicked: {label}")
+                time.sleep(1.2)
+                return True
+        except Exception:
+            pass
+
+        now = time.time()
+        if now - last_log >= 5:
+            log(f"[B2B] Waiting for {label}...")
+            last_log = now
+
+        time.sleep(0.25)
+
+    log(f"[B2B] {label} was not found or not clickable within {timeout} seconds.")
+    return False
+
+
+def _b2b_has_any_setup_next_button(driver) -> bool:
+    """True when a #setupNextBtn / visible Next control exists (VidaPay
+    has_any_setup_next_button). Checks DOM presence first — B2BSoft renders
+    the button before Selenium reports it visible."""
+    from selenium.webdriver.common.by import By
+    try:
+        if driver.find_elements(By.ID, "setupNextBtn"):
+            return True
+        for btn in driver.find_elements(By.XPATH, "//button[normalize-space()='Next']"):
+            try:
+                if btn.is_displayed():
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        return bool(driver.execute_script(
+            """
+            function visible(el) {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return (
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    style.opacity !== '0' &&
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    el.getClientRects().length > 0 &&
+                    !el.disabled &&
+                    el.getAttribute('aria-disabled') !== 'true'
+                );
+            }
+
+            const byId = document.querySelector('button#setupNextBtn');
+            if (visible(byId)) return true;
+
+            return Array.from(document.querySelectorAll('button, input[type=button], input[type=submit]')).some(el => {
+                const text = (el.innerText || el.value || '').trim().toLowerCase();
+                return visible(el) && (text === 'next' || text.includes('next'));
+            });
+            """
+        ))
+    except Exception:
+        return False
+
+
+def _b2b_select_trust_radio(driver, stop_event=None, timeout: int = 180, log=print) -> bool:
+    """Select the Trust Device radio (#trustRadio) as soon as it exists in the DOM.
+
+    Port of VidaPay select_trust_radio_quickly: the Next button stays disabled
+    until the radio is checked, and B2BSoft places the radio in the HTML before
+    it renders visually — so force-check it via JS instead of waiting for
+    visibility. Keeps waiting through 2FA approval and Cloudflare interludes.
+    """
+    deadline = time.time() + timeout
+    last_log = 0.0
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return False
+        try:
+            selected = driver.execute_script(
+                """
+                const radio = document.querySelector('#trustRadio');
+                if (!radio) return false;
+
+                radio.removeAttribute('disabled');
+                radio.disabled = false;
+                radio.removeAttribute('aria-disabled');
+                radio.checked = true;
+
+                try { radio.scrollIntoView({block: 'center'}); } catch (err) {}
+                try { radio.focus(); } catch (err) {}
+                try { radio.click(); } catch (err) {}
+
+                radio.dispatchEvent(new Event('input', { bubbles: true }));
+                radio.dispatchEvent(new Event('change', { bubbles: true }));
+                return true;
+                """
+            )
+            if selected:
+                log("[B2B] Trust Device radio selected from DOM location.")
+                time.sleep(0.2)
+                return True
+        except Exception:
+            pass
+
+        state = _b2b_get_page_state(driver)
+
+        if state == _B2B_STATE_VERIFY:
+            if not _b2b_wait_for_human_verification_clear(driver, stop_event=stop_event, log=log):
+                return False
+            continue
+
+        if state in (_B2B_STATE_PORTAL, _B2B_STATE_READY_TO_GO,
+                     _B2B_STATE_SECURITY_UPG, _B2B_STATE_SETUP_NEXT):
+            log("[B2B] Already past Trust Device radio — continuing setup flow.")
+            return True
+
+        now = time.time()
+        if now - last_log >= 8:
+            if state == _B2B_STATE_TWO_FA:
+                log("[B2B] Still on 2FA page — waiting for approval and Trust Device controls...")
+            else:
+                log(f"[B2B] Waiting for Trust Device radio… (page: {state})")
+            last_log = now
+
+        time.sleep(0.5)
+
+    log("[B2B] Trust Device radio did not appear before timeout.")
+    return False
+
+
+def _b2b_wait_for_states(driver, stop_event=None, wanted=(), timeout: int = 90,
+                         log=print, prefix="State wait"):
+    """Poll until one of `wanted` states is reached (port of VidaPay wait_for_state)."""
+    deadline = time.time() + timeout
+    last_state = None
+    while time.time() < deadline:
+        if stop_event is not None and stop_event.is_set():
+            return None
+        state = _b2b_get_page_state(driver)
+        if state != last_state:
+            log(f"[B2B] {prefix}: {state}")
+            last_state = state
+        if state == _B2B_STATE_VERIFY:
+            if not _b2b_wait_for_human_verification_clear(driver, stop_event=stop_event, log=log):
+                return None
+            last_state = None
+            continue
+        if state in wanted:
+            return state
+        time.sleep(0.5)
+    log(f"[B2B] Timed out while waiting for: {', '.join(wanted)}")
+    return None
+
+
+def _b2b_find_later_buttons(driver):
+    """All visible 'Later' alert-dismissal buttons (port of VidaPay finder)."""
+    from selenium.webdriver.common.by import By
+    xpaths = [
+        "//button[normalize-space()='Later']",
+        "//button[contains(normalize-space(),'Later')]",
+        "//a[normalize-space()='Later']",
+        "//a[contains(normalize-space(),'Later')]",
+        "//*[@role='button' and normalize-space()='Later']",
+        "//*[@role='button' and contains(normalize-space(),'Later')]",
+        "//*[self::button or self::a or @role='button'][contains(normalize-space(), 'Later')]",
+    ]
+    seen, out = set(), []
+    for xp in xpaths:
+        try:
+            for btn in driver.find_elements(By.XPATH, xp):
+                try:
+                    if btn.is_displayed() and btn.id not in seen:
+                        seen.add(btn.id)
+                        out.append(btn)
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return out
+
+
+def _b2b_clear_later_alerts(driver, log=print, max_clicks: int = 12) -> int:
+    """Dismiss the portal's 'Later' popup alerts (port of VidaPay
+    clear_all_later_alerts) so report navigation isn't blocked."""
+    clicked, idle_rounds = 0, 0
+    while clicked < max_clicks:
+        buttons = _b2b_find_later_buttons(driver)
+        if not buttons:
+            idle_rounds += 1
+            if idle_rounds >= 2:
+                break
+            time.sleep(0.5)
+            continue
+        idle_rounds = 0
+        btn = buttons[0]
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+            time.sleep(0.3)
+            try:
+                btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+            clicked += 1
+            log(f"[B2B] Dismissed portal alert (Later) #{clicked}.")
+            time.sleep(1.0)
+        except Exception:
+            break
+    if clicked:
+        log(f"[B2B] Later alerts cleared — clicked {clicked} button(s).")
+    else:
+        log("[B2B] No Later alerts found.")
+    return clicked
+
+
+def _b2b_complete_setup_next_flow(driver, stop_event=None, log=print,
+                                  max_next_clicks: int = 6) -> bool:
+    """Walk every remaining 2FA setup page until the portal loads.
+
+    Port of VidaPay complete_remaining_setup_next_flow:
+      Trust Device (radio + Next) → Setup Next pages (#setupNextBtn) →
+      Ready To Go (Continue) → portal. The Security Upgrade page's Next must
+      NOT be clicked — it throws error=io without a selected option — so we
+      wait for it to advance on its own.
+    """
+    steps_done = 0
+    while steps_done < max_next_clicks:
+        if stop_event is not None and stop_event.is_set():
+            return False
+
+        state = _b2b_get_page_state(driver)
+        log(f"[B2B] Setup flow page: {state}")
+
+        if state == _B2B_STATE_VERIFY:
+            if not _b2b_wait_for_human_verification_clear(driver, stop_event=stop_event, log=log):
+                return False
+            continue
+
+        if state == _B2B_STATE_PORTAL:
+            log("[B2B] Setup flow completed — portal loaded.")
+            return True
+
+        if state == _B2B_STATE_SECURITY_UPG:
+            log("[B2B] Security Upgrade page — NOT clicking Next (errors without a selected option); waiting for it to advance…")
+            wait_state = _b2b_wait_for_states(
+                driver, stop_event=stop_event,
+                wanted=(_B2B_STATE_READY_TO_GO, _B2B_STATE_PORTAL),
+                timeout=20, log=log, prefix="Security upgrade wait")
+            if wait_state == _B2B_STATE_READY_TO_GO:
+                continue
+            if wait_state == _B2B_STATE_PORTAL:
+                return True
+            log("[B2B] Security upgrade page did not advance safely — manual review needed.")
+            return False
+
+        if state == _B2B_STATE_TRUST_DEVICE:
+            if not _b2b_select_trust_radio(driver, stop_event=stop_event, log=log):
+                return False
+            if not _b2b_click_button(driver, label="Trust Device Next",
+                                     text_contains="next", button_id="setupNextBtn",
+                                     timeout=30, log=log):
+                return False
+            steps_done += 1
+            time.sleep(1)
+            continue
+
+        if state == _B2B_STATE_SETUP_NEXT:
+            if not _b2b_click_button(driver, label="Setup Next",
+                                     text_contains="next", button_id="setupNextBtn",
+                                     timeout=30, log=log):
+                state_after = _b2b_get_page_state(driver)
+                if state_after == _B2B_STATE_PORTAL:
+                    log("[B2B] Portal loaded before Setup Next click — continuing.")
+                    return True
+                if state_after == _B2B_STATE_READY_TO_GO:
+                    continue
+                return False
+            steps_done += 1
+            time.sleep(1)
+            continue
+
+        if state == _B2B_STATE_READY_TO_GO:
+            clicked = _b2b_click_button(driver, label="Ready To Go Continue",
+                                        text_contains="continue", timeout=18, log=log)
+            if not clicked:
+                # Older B2BSoft variants reuse #setupNextBtn on Ready To Go.
+                clicked = _b2b_click_button(driver, label="Ready To Go final Next fallback",
+                                            text_contains="next", button_id="setupNextBtn",
+                                            timeout=8, log=log)
+            if not clicked:
+                return False
+            wait_state = _b2b_wait_for_states(
+                driver, stop_event=stop_event, wanted=(_B2B_STATE_PORTAL,),
+                timeout=90, log=log, prefix="After Ready To Go Continue")
+            return wait_state == _B2B_STATE_PORTAL
+
+        # NEW_SIGN / TWO_FA / UNKNOWN / LOGIN — wait for a setup or terminal state
+        wait_state = _b2b_wait_for_states(
+            driver, stop_event=stop_event,
+            wanted=(_B2B_STATE_TRUST_DEVICE, _B2B_STATE_SETUP_NEXT,
+                    _B2B_STATE_READY_TO_GO, _B2B_STATE_SECURITY_UPG,
+                    _B2B_STATE_PORTAL),
+            timeout=45, log=log, prefix="next setup step")
+        if wait_state is None:
+            log("[B2B] No more setup pages found and portal did not load.")
+            return False
+        if wait_state == _B2B_STATE_PORTAL:
+            return True
+        steps_done += 1
+
+    log(f"[B2B] Setup flow hit the safety limit after {max_next_clicks} setup action(s).")
+    return _b2b_get_page_state(driver) == _B2B_STATE_PORTAL
+
+
+def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 300) -> bool:
+    """State machine for post-login B2B flow — ports VidaPay's
+    handle_ibm_verify_and_setup → finish_setup_steps →
+    complete_remaining_setup_next_flow chain.
+
+    Handles (everything AFTER the access code / credentials steps):
       - New Sign In (unrecognized device) → click Next
-      - 2FA / OTP verification → wait for user to approve (up to timeout seconds)
+      - 2FA / OTP verification → wait for user approval
+      - Trust Device radio → #setupNextBtn walk → Ready To Go → portal
+      - Security Upgrade page → wait it out (never click its Next)
       - Cloudflare re-verification → wait to clear
-      - Portal loaded → done
+      - Portal/alert popups → dismiss 'Later' alerts → done
     """
     deadline = time.time() + timeout
     last_log = 0.0
@@ -3375,6 +3783,7 @@ def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 30
 
         if state == _B2B_STATE_PORTAL:
             log("✓ B2B portal reached — login complete.")
+            _b2b_clear_later_alerts(driver, log=log)
             return True
 
         if state == _B2B_STATE_VERIFY:
@@ -3398,58 +3807,14 @@ def _b2b_finish_login_flow(driver, stop_event=None, log=print, timeout: int = 30
             time.sleep(2)
             continue
 
-        if state == _B2B_STATE_TRUST_DEVICE:
-            log("[B2B] Trust Device page — clicking Next…")
-            if not _b2b_click_any_next(driver, log=log):
-                # Try Continue as fallback
-                from selenium.webdriver.support.ui import WebDriverWait
-                from selenium.webdriver.support import expected_conditions as EC
-                try:
-                    btn = WebDriverWait(driver, 8).until(
-                        EC.element_to_be_clickable((By.XPATH,
-                            "//button[contains(normalize-space(),'Continue')] | "
-                            "//button[contains(normalize-space(),'Trust')] | "
-                            "//input[@type='submit']"
-                        ))
-                    )
-                    driver.execute_script("arguments[0].click();", btn)
-                    log(f"Trust Device: clicked fallback button: {btn.text.strip()}")
-                except Exception:
-                    log("Trust Device: could not find any button — waiting for page to advance.")
-            last_state = None
-            time.sleep(2)
-            continue
-
-        if state == _B2B_STATE_READY_TO_GO:
-            log("[B2B] Ready To Go page — clicking Continue…")
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
-            clicked = False
-            for xpath in [
-                "//button[contains(normalize-space(),'Continue')]",
-                "//button[contains(normalize-space(),'Next')]",
-                "//button[contains(normalize-space(),'Finish')]",
-                "//input[@type='submit']",
-            ]:
-                try:
-                    btn = WebDriverWait(driver, 8).until(
-                        EC.element_to_be_clickable((By.XPATH, xpath))
-                    )
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-                    try:
-                        btn.click()
-                    except Exception:
-                        driver.execute_script("arguments[0].click();", btn)
-                    log(f"Ready To Go: clicked {btn.text.strip() or xpath}")
-                    clicked = True
-                    break
-                except Exception:
-                    continue
-            if not clicked:
-                log("Ready To Go: no button found — waiting for portal.")
-            last_state = None
-            time.sleep(2)
-            continue
+        if state in (_B2B_STATE_TRUST_DEVICE, _B2B_STATE_SETUP_NEXT,
+                     _B2B_STATE_READY_TO_GO, _B2B_STATE_SECURITY_UPG):
+            # Trust radio → #setupNextBtn walk → Ready To Go → portal is one
+            # continuous walk; delegate to the ported VidaPay flow.
+            ok = _b2b_complete_setup_next_flow(driver, stop_event=stop_event, log=log)
+            if ok:
+                _b2b_clear_later_alerts(driver, log=log)
+            return ok
 
         if state == _B2B_STATE_LOGIN:
             log("B2B returned to login page — credentials may be wrong.")

@@ -13,7 +13,7 @@ matched employee for stores absent from the count file):
 
 These tests extract ``pending_inventory_count_message`` (plus its
 dependencies ``safe_text``, ``normalize_phone``, ``whatsapp_mention`` and
-``InventoryStatusRow``) from the standalone ``GFH_Inventory_Audit_Timesheet.py``
+``InventoryStatusRow``) from the standalone ``GFH_Inventory_Audit_Automation.py``
 script via the AST, so no GUI / selenium imports are needed.
 """
 import ast
@@ -24,7 +24,7 @@ from types import SimpleNamespace
 from typing import List
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SCRIPT = REPO_ROOT / "GFH_Inventory_Audit_Timesheet.py"
+SCRIPT = REPO_ROOT / "GFH_Inventory_Audit_Automation.py"
 
 FORBIDDEN_TEXTS = (
     "Count not completed",

@@ -21,8 +21,7 @@ import pytest
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 MONOLITHS = (
-    os.path.join(ROOT, "GFH_Inventory_Audit_Timesheet.py"),
-    os.path.join(ROOT, "GFH_Inventory_Audit.py"),
+    os.path.join(ROOT, "GFH_Inventory_Audit_Automation.py"),
 )
 
 # Light-theme pastels are allowed ONLY inside the light palette branch of
