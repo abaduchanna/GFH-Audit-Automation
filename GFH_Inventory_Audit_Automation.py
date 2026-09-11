@@ -1056,6 +1056,88 @@ def filter_latest_inventory_records(inventory_records: List[Dict[str, str]]) -> 
     return filtered, metrics
 
 
+def filter_inventory_rows_to_today(
+    inventory_records: List[Dict[str, str]],
+    source_name: str = "",
+) -> Tuple[List[Dict[str, str]], Dict[str, int]]:
+    """Fallback for failed Today exports: keep ONLY rows dated today.
+
+    User rule: "when you failed to download today's inventory count details,
+    then only select today's details from the sheet." When the date-range
+    dropdown misses, the B2B export lands as the Month-to-Date file
+    (Inventory_Count_Result_Details_09012026-09112026.Xlsx). Loading all of
+    it made ONE employee appear at SEVERAL stores — his counts from earlier
+    days at other stores — and mixed stale rows into the status/variance
+    views (the "Muhammad Shoaib — Boulder, Kipling, Mississippi, South
+    Havana" bug).
+
+    Trigger (either is enough):
+      - the file NAME carries a multi-day range suffix
+        (_MMDDYYYY-MMDDYYYY with two different dates), or
+      - the rows themselves span more than one day.
+
+    The filter keeps rows whose Created Date equals today. If no row is
+    dated today, the file's LATEST day is used instead — never a mix of
+    days (protects against clock skew / just-after-midnight exports).
+    """
+    metrics = {
+        "today_filter_mode": "off",   # off | filename-range | multi-day-data
+        "today_rows_kept": len(inventory_records),
+        "today_rows_dropped": 0,
+        "today_target_date": "",
+    }
+    if not inventory_records:
+        return inventory_records, metrics
+
+    sample = inventory_records[0]
+    created_date_col = find_column(
+        sample, ["Created Date", "Created Date/Time", "Date Time", "Date"])
+
+    def _row_day(rec: Dict[str, str]) -> Optional[dt.date]:
+        if not created_date_col:
+            return None
+        parsed = excel_serial_to_datetime(rec.get(created_date_col, ""))
+        return parsed.date() if parsed else None
+
+    needs_filter = False
+    trigger = ""
+    # 1) Filename range: Inventory_Count_Result_Details_09012026-09112026.Xlsx
+    m = re.search(r"_(\d{2})(\d{2})(\d{4})-(\d{2})(\d{2})(\d{4})", source_name or "")
+    if m:
+        try:
+            start_day = dt.date(int(m.group(3)), int(m.group(1)), int(m.group(2)))
+            end_day = dt.date(int(m.group(6)), int(m.group(4)), int(m.group(5)))
+            if start_day != end_day:
+                needs_filter = True
+                trigger = "filename-range"
+        except ValueError:
+            pass
+    # 2) Data spans several days (covers renamed/moved files too).
+    row_days = [_row_day(rec) for rec in inventory_records]
+    parsed_days = {day for day in row_days if day is not None}
+    if not needs_filter and len(parsed_days) > 1:
+        needs_filter = True
+        trigger = "multi-day-data"
+    if not needs_filter:
+        return inventory_records, metrics
+
+    metrics["today_filter_mode"] = trigger
+    today = dt.date.today()
+    target = today
+    if parsed_days and today not in parsed_days:
+        target = max(parsed_days)
+    metrics["today_target_date"] = target.isoformat()
+    filtered = [rec for rec, day in zip(inventory_records, row_days)
+                if day is not None and day == target]
+    if not filtered:
+        # Dates exist but none parsed to a comparable day — keep the
+        # original set rather than shipping an empty audit.
+        return inventory_records, {**metrics, "today_filter_mode": "off"}
+    metrics["today_rows_kept"] = len(filtered)
+    metrics["today_rows_dropped"] = len(inventory_records) - len(filtered)
+    return filtered, metrics
+
+
 def extract_variances(
     inventory_records: List[Dict[str, str]],
     time_sheet_records: List[Dict[str, str]],
@@ -4285,6 +4367,16 @@ def _harden_attached_driver(driver, log=None) -> bool:
     return ok
 
 
+# ONE global lock for every tab operation on the shared automation Edge.
+# All 8 districts share ONE browser window (port 9227); without this lock the
+# startup tab-open, each export cycle's tab pre-open, both scraper drivers
+# and WhatsApp tab recovery all ran check-then-act against each other and
+# kept spawning duplicate tabs / stealing tab focus mid-scrape (the
+# "automation is fighting over opening tabs" bug). Reentrant so nested
+# _find_or_open_tab calls inside a lock-holding scrape are safe.
+_BROWSER_LOCK = threading.RLock()
+
+
 def _find_or_open_tab(driver, url: str, log=None) -> None:
     """Switch to an existing tab on url's origin; open one when absent.
 
@@ -4296,78 +4388,84 @@ def _find_or_open_tab(driver, url: str, log=None) -> None:
       4. CDP Target.createTarget       → recovers when window.open is blocked
       5. OS-level real Edge tab        → recovers when the browser rejected
                                           every in-process creation
+
+    The whole check-then-act body runs under _BROWSER_LOCK: two concurrent
+    callers used to both miss the same-origin tab and each open a duplicate,
+    and one caller's blank-tab navigation could be re-pointed by another
+    caller mid-flight.
     """
     from urllib.parse import urlparse
-    parsed = urlparse(url)
-    origin = f"{parsed.scheme}://{parsed.netloc}"
-    handles = _get_driver_handles(driver)
-    blank_handle = None
-    for handle in handles:
+    with _BROWSER_LOCK:
+        parsed = urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        handles = _get_driver_handles(driver)
+        blank_handle = None
+        for handle in handles:
+            try:
+                driver.switch_to.window(handle)
+                cur = driver.current_url
+            except Exception:
+                continue
+            if cur and cur.startswith(origin):
+                return
+            if blank_handle is None and not _is_browser_chrome_url(cur) and (
+                    any(cur == b or cur.startswith(b) for b in _BLANK_TAB_URLS)):
+                blank_handle = handle
+        if blank_handle is not None:
+            try:
+                driver.switch_to.window(blank_handle)
+                driver.get(url)
+                return
+            except Exception:
+                pass
+        # Tier 3: a fresh tab in the same window.
         try:
-            driver.switch_to.window(handle)
-            cur = driver.current_url
-        except Exception:
-            continue
-        if cur and cur.startswith(origin):
-            return
-        if blank_handle is None and not _is_browser_chrome_url(cur) and (
-                any(cur == b or cur.startswith(b) for b in _BLANK_TAB_URLS)):
-            blank_handle = handle
-    if blank_handle is not None:
-        try:
-            driver.switch_to.window(blank_handle)
+            driver.switch_to.new_window("tab")
+            time.sleep(0.4)
             driver.get(url)
+            if log:
+                log("Opened a new Edge tab for the page (window recovery).")
             return
         except Exception:
             pass
-    # Tier 3: a fresh tab in the same window.
-    try:
-        driver.switch_to.new_window("tab")
-        time.sleep(0.4)
-        driver.get(url)
-        if log:
-            log("Opened a new Edge tab for the page (window recovery).")
-        return
-    except Exception:
-        pass
-    # Tier 4: DevTools target creation.
-    try:
-        before = set(_get_driver_handles(driver))
-        driver.execute_cdp_cmd("Target.createTarget", {"url": url})
-        time.sleep(1)
-        new = [h for h in _get_driver_handles(driver) if h not in before]
-        for handle in reversed(new or _get_driver_handles(driver)):
+        # Tier 4: DevTools target creation.
+        try:
+            before = set(_get_driver_handles(driver))
+            driver.execute_cdp_cmd("Target.createTarget", {"url": url})
+            time.sleep(1)
+            new = [h for h in _get_driver_handles(driver) if h not in before]
+            for handle in reversed(new or _get_driver_handles(driver)):
+                try:
+                    driver.switch_to.window(handle)
+                    if log:
+                        log("Opened the page via DevTools target (window.open was blocked).")
+                    return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # Tier 5: real OS tab through the automation profile.
+        _open_real_edge_tab(url)
+        time.sleep(2)
+        for handle in _get_driver_handles(driver):
             try:
                 driver.switch_to.window(handle)
-                if log:
-                    log("Opened the page via DevTools target (window.open was blocked).")
-                return
+                cur = driver.current_url or ""
             except Exception:
                 continue
-    except Exception:
-        pass
-    # Tier 5: real OS tab through the automation profile.
-    _open_real_edge_tab(url)
-    time.sleep(2)
-    for handle in _get_driver_handles(driver):
+            if cur.startswith(origin):
+                if log:
+                    log("Opened the page in a real Edge tab (OS-level recovery).")
+                return
+        # Same-origin tab never appeared — leave Selenium on any live content tab
+        # and navigate it directly as a final attempt.
+        _switch_to_first_live_content_tab(driver, log=log)
         try:
-            driver.switch_to.window(handle)
-            cur = driver.current_url or ""
+            driver.get(url)
         except Exception:
-            continue
-        if cur.startswith(origin):
-            if log:
-                log("Opened the page in a real Edge tab (OS-level recovery).")
-            return
-    # Same-origin tab never appeared — leave Selenium on any live content tab
-    # and navigate it directly as a final attempt.
-    _switch_to_first_live_content_tab(driver, log=log)
-    try:
-        driver.get(url)
-    except Exception:
-        pass
-    if log:
-        log(f"⚠ Tab for {origin} could not be confirmed — navigated the current tab instead.")
+            pass
+        if log:
+            log(f"⚠ Tab for {origin} could not be confirmed — navigated the current tab instead.")
 
 
 def _humanize_list(items: list) -> str:
@@ -4396,22 +4494,26 @@ def open_monitoring_tabs(port: int = EDGE_DEBUG_PORT, include_whatsapp: bool = T
 
     opened: list = []
     for attempt in (1, 2):
-        try:
-            driver = _edge_debug_driver(port)
-            _harden_attached_driver(driver, log=log)
-            opened = []
-            for url, name in targets:
-                try:
-                    _find_or_open_tab(driver, url, log=log)
-                    opened.append(name)
-                except Exception as exc:
-                    if log:
-                        log(f"⚠ Could not open the {name} tab: {exc}")
-            if opened:
-                return opened
-        except Exception as exc:
-            if log:
-                log(f"⚠ Tab-open attempt {attempt} failed: {exc}")
+        # One lock hold per attempt: all target tabs open as an atomic batch,
+        # so a concurrent scrape or WhatsApp send can't interleave tab opens
+        # (the districts-vs-export-cycle tab fight).
+        with _BROWSER_LOCK:
+            try:
+                driver = _edge_debug_driver(port)
+                _harden_attached_driver(driver, log=log)
+                opened = []
+                for url, name in targets:
+                    try:
+                        _find_or_open_tab(driver, url, log=log)
+                        opened.append(name)
+                    except Exception as exc:
+                        if log:
+                            log(f"⚠ Could not open the {name} tab: {exc}")
+                if opened:
+                    return opened
+            except Exception as exc:
+                if log:
+                    log(f"⚠ Tab-open attempt {attempt} failed: {exc}")
         if attempt == 1 and log:
             log("Retrying tab setup after re-launching the automation Edge…")
             _ensure_edge_open(port, log=log)
@@ -5287,14 +5389,32 @@ class B2BSoftScraper:
             _fill_credentials()
             if not _submit_credentials():
                 self.log("Warning: no login button found after credentials.")
-            # Wait for URL change (page navigates away from login) — mirrors VidaPay.
+            # Wait for URL change (page navigates away from login) — mirrors
+            # VidaPay. The portal is an SPA: a SUCCESSFUL sign-in often does
+            # not change the URL, so the old blind 15s URL-only wait always
+            # expired with a scary "URL did not change" even when login had
+            # worked (the next state check then proved PORTAL). Accept the
+            # portal page state as success and bail out early.
             old_url = drv.current_url
-            try:
-                from selenium.webdriver.support.ui import WebDriverWait as _WDW
-                _WDW(drv, 15).until(lambda d: d.current_url != old_url)
-                self.log("URL changed after login.")
-            except Exception:
-                self.log("URL did not change after login click — continuing.")
+            _login_advanced = False
+            _login_deadline = time.time() + 15
+            while time.time() < _login_deadline:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                try:
+                    if drv.current_url != old_url:
+                        self.log("URL changed after login.")
+                        _login_advanced = True
+                        break
+                    if _b2b_get_page_state(drv) == _B2B_STATE_PORTAL:
+                        self.log("Portal reached after login (URL unchanged — SPA).")
+                        _login_advanced = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(1)
+            if not _login_advanced:
+                self.log("URL unchanged and portal not detected yet — continuing to the login state machine.")
             # Invalid-credentials detection + re-entry (extractor login_store).
             for _cred_retry in range(2):
                 time.sleep(1.5)
@@ -5398,6 +5518,12 @@ class B2BSoftScraper:
         diagnosable from the log alone.
         """
         from selenium.webdriver.common.by import By
+        # CRITICAL: this method is NOT nested inside login() — `drv` used to
+        # be undefined here, so EVERY drv.execute_script raised NameError,
+        # the bare `except Exception` swallowed it, and the run always ended
+        # at "⚠ No date-range dropdown found" → Month-to-Date exports. The
+        # NameError (not the page) was the real dropdown-missing bug.
+        drv = self.driver
         js_set_today = """
             var selects = Array.prototype.slice.call(document.querySelectorAll('select'));
             Array.prototype.slice.call(document.querySelectorAll('.ts-wrapper'))
@@ -5445,13 +5571,45 @@ class B2BSoftScraper:
             c.sel.dispatchEvent(new Event('change', {bubbles: true}));
             return 'raw-set:' + chosen.v;
         """
-        result = ""
-        deadline = time.time() + 30
-        while time.time() < deadline:
+        def _try_set_today_everywhere() -> str:
+            """Run js_set_today on the main document AND every same-origin
+            iframe. The report sometimes renders its toolbar inside an
+            iframe — document.querySelectorAll then found nothing and every
+            attempt expired with 'No date-range dropdown found'. Returns the
+            js_set_today result, suffixed '@iframeN' when an iframe had it.
+            """
             try:
-                result = str(drv.execute_script(js_set_today) or "")
+                r = str(drv.execute_script(js_set_today) or "")
             except Exception:
-                result = ""
+                r = ""
+            if r and r != "no-ts":
+                return r
+            try:
+                frames = drv.find_elements(By.TAG_NAME, "iframe")
+            except Exception:
+                return r or "no-ts"
+            for idx, fr in enumerate(frames[:6]):
+                try:
+                    drv.switch_to.frame(fr)
+                except Exception:
+                    continue
+                try:
+                    r2 = str(drv.execute_script(js_set_today) or "")
+                except Exception:
+                    r2 = ""
+                finally:
+                    try:
+                        drv.switch_to.default_content()
+                    except Exception:
+                        pass
+                if r2 and r2 != "no-ts":
+                    return f"{r2}@iframe{idx}"
+            return r or "no-ts"
+
+        result = ""
+        deadline = time.time() + 40
+        while time.time() < deadline:
+            result = _try_set_today_everywhere()
             if result and result != "no-ts":
                 break
             time.sleep(0.5)
@@ -5521,10 +5679,7 @@ class B2BSoftScraper:
                 return
             _ts_full_click(ctrl)
             time.sleep(0.8)
-            try:
-                result = str(drv.execute_script(js_set_today) or "")
-            except Exception:
-                result = ""
+            result = _try_set_today_everywhere()
             if result.startswith("ts-set:") or result.startswith("raw-set:"):
                 self.log(f"✓ Date-range dropdown set to 'Today' ({result}) — waiting for the grid to refresh.")
                 time.sleep(4)
@@ -5547,10 +5702,7 @@ class B2BSoftScraper:
                 self.log("⚠ 'Today' option not found in the date-range dropdown — exporting with the current range.")
                 return
             time.sleep(1.2)
-            try:
-                chk = str(drv.execute_script(js_set_today) or "")
-            except Exception:
-                chk = ""
+            chk = _try_set_today_everywhere()
             if chk in ("already", "already-raw") or chk.startswith("ts-set:") or chk.startswith("raw-set:"):
                 self.log(f"✓ Date-range dropdown set to 'Today' (UI click, {chk}) — waiting for the grid to refresh.")
                 time.sleep(4)
@@ -6790,120 +6942,139 @@ class GFHApp(tk.Tk):
             return
         self._log_scheduler("⟳ Running export cycle…")
         def _run():
-            # Pre-open separate tabs so each scraper gets its own tab (and a
-            # WhatsApp Web tab when WhatsApp Web mode is selected).
+            # EVERYTHING that touches tabs or drives the shared Edge runs
+            # under ONE global browser lock: the startup tab-open, WhatsApp
+            # tab recovery and message sends can no longer switch/spawn tabs
+            # while B2B or the timesheet scraper is mid-navigation. Districts
+            # no longer fight over opening tabs — later callers simply wait.
+            _BROWSER_LOCK.acquire()
             try:
-                names = self._sched_open_tabs()
-                if names:
-                    self.after(0, lambda n=list(names): self._log_tabs_opened(n))
-            except Exception:
-                pass
-
-            # Build both scrapers upfront — init tab handles sequentially before scraping.
-            brs = B2BSoftScraper(
-                company_id=self.brs_company_id_var.get().strip(),
-                account_id=self.brs_account_id_var.get().strip(),
-                username=self.brs_username_var.get().strip(),
-                password=self.brs_password_var.get(),
-                download_dir=EXPORT_DIR,
-                log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[B2B] {m}")),
-            )
-            brs._make_driver()
-
-            ts = TimesheetScraper(
-                email=self.ts_email_var.get().strip(),
-                password=self.ts_password_var.get(),
-                download_dir=EXPORT_DIR,
-                log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[TS] {m}")),
-            )
-            ts._make_driver()
-
-            inv_file = None
-            ts_file = None
-
-            def _run_b2b():
-                nonlocal inv_file
+                # Pre-open separate tabs so each scraper gets its own tab (and a
+                # WhatsApp Web tab when WhatsApp Web mode is selected).
                 try:
-                    brs.login()
-                    brs.navigate_to_report()
-                    inv_file = brs.download_xlsx()
-                except Exception as exc:
-                    self.after(0, lambda: self._log_scheduler(f"⚠ B2B export error: {exc}"))
-                finally:
-                    brs.quit()
+                    names = self._sched_open_tabs()
+                    if names:
+                        self.after(0, lambda n=list(names): self._log_tabs_opened(n))
+                except Exception:
+                    pass
 
-            def _run_ts():
-                nonlocal ts_file
-                try:
-                    ts.login()
-                    ts_file = ts.download_xlsx()
-                except Exception as exc:
-                    self.after(0, lambda: self._log_scheduler(f"⚠ Timesheet export error: {exc}"))
-                finally:
-                    ts.quit()
+                # Build both scrapers upfront — init tab handles sequentially before scraping.
+                brs = B2BSoftScraper(
+                    company_id=self.brs_company_id_var.get().strip(),
+                    account_id=self.brs_account_id_var.get().strip(),
+                    username=self.brs_username_var.get().strip(),
+                    password=self.brs_password_var.get(),
+                    download_dir=EXPORT_DIR,
+                    log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[B2B] {m}")),
+                )
+                brs._make_driver()
 
-            # Run B2B then Timesheet sequentially — both share the same Edge browser
-            # (port 9227). Parallel switch_to.window() calls on the same browser
-            # race and corrupt each other's tab focus.
-            try:
-                _run_b2b()
-                _run_ts()
-            except Exception as exc:
-                self.after(0, lambda: self._log_scheduler(f"⚠ Export cycle error: {exc}"))
-            finally:
-                # Reload variances and optionally send variance image — must
-                # run on EVERY cycle. This block used to sit inside the except
-                # handler, and _run_b2b/_run_ts swallow their own errors, so on
-                # a normal successful export load_variances() never ran and the
-                # Status tab stayed empty until a manual Load Variances click.
-                _district_for_send = district
-                def _reload_and_send():
+                ts = TimesheetScraper(
+                    email=self.ts_email_var.get().strip(),
+                    password=self.ts_password_var.get(),
+                    download_dir=EXPORT_DIR,
+                    log_fn=lambda m: self.after(0, lambda: self._log_scheduler(f"[TS] {m}")),
+                )
+                ts._make_driver()
+
+                inv_file = None
+                ts_file = None
+
+                def _run_b2b():
+                    nonlocal inv_file
                     try:
-                        if inv_file and inv_file.exists():
-                            self.inventory_path.set(str(inv_file))
-                            self._log_scheduler(f"Loaded B2B file: {inv_file.name}")
-                        if ts_file and ts_file.exists():
-                            self.time_sheet_path.set(str(ts_file))
-                            self._log_scheduler(f"Loaded timesheet: {ts_file.name}")
-                        # Require both files to call load_variances (avoids missing-file dialog).
-                        both_ready = (
-                            inv_file and inv_file.exists() and
-                            ts_file and ts_file.exists()
-                        )
-                        if both_ready:
-                            self.load_variances()
-                            self._auto_import_stores_from_inventory()
-
-                        # Send starting message + status image for every fired district.
-                        # This is the ONLY place starting messages send — after export attempt.
-                        fired = list(getattr(self, "_scheduler_fired_districts", set()))
-                        pending = getattr(self, "_scheduler_pending_messages", None)
-                        if pending is None:
-                            self._scheduler_pending_messages = set(fired)
-                            pending = self._scheduler_pending_messages
-                        unsent = [d for d in fired if d in pending]
-                        if unsent:
-                            # One thread sends all districts sequentially — no concurrent UI fight
-                            # (critical for desktop mode; web mode also benefits from sequential tab use).
-                            for d in unsent:
-                                self._log_scheduler(f"💬 Sending starting message → {d}")
-                            normalized = [normalize_district(d) for d in unsent]
-                            threading.Thread(
-                                target=self._send_starting_message_thread,
-                                args=(normalized,),
-                                daemon=True,
-                                name="StartingMessages",
-                            ).start()
-                            for d in unsent:
-                                if both_ready:
-                                    self._auto_send_status_image(d)
-                                pending.discard(d)
-
-                        if _district_for_send:
-                            self._auto_send_variance_image(_district_for_send)
+                        brs.login()
+                        brs.navigate_to_report()
+                        inv_file = brs.download_xlsx()
                     except Exception as exc:
-                        self._log_scheduler(f"⚠ Reload error: {exc}")
-                self.after(0, _reload_and_send)
+                        # NOTE: bind exc via default arg — `except ... as exc`
+                        # deletes the name at block exit, and this lambda runs
+                        # LATER on the Tk thread (bare lambdas NameError'd and
+                        # the error message silently never appeared).
+                        self.after(0, lambda e=exc: self._log_scheduler(f"⚠ B2B export error: {e}"))
+                    finally:
+                        brs.quit()
+
+                def _run_ts():
+                    nonlocal ts_file
+                    try:
+                        ts.login()
+                        ts_file = ts.download_xlsx()
+                    except Exception as exc:
+                        self.after(0, lambda e=exc: self._log_scheduler(f"⚠ Timesheet export error: {e}"))
+                    finally:
+                        ts.quit()
+
+                # Run B2B then Timesheet sequentially — both share the same Edge browser
+                # (port 9227), and the whole sequence now also holds the global browser
+                # lock so no other thread can touch tabs mid-scrape.
+                try:
+                    _run_b2b()
+                    _run_ts()
+                except Exception as exc:
+                    self.after(0, lambda e=exc: self._log_scheduler(f"⚠ Export cycle error: {e}"))
+                finally:
+                    # Reload variances and optionally send variance image — must
+                    # run on EVERY cycle. This block used to sit inside the except
+                    # handler, and _run_b2b/_run_ts swallow their own errors, so on
+                    # a normal successful export load_variances() never ran and the
+                    # Status tab stayed empty until a manual Load Variances click.
+                    _district_for_send = district
+                    def _reload_and_send():
+                        try:
+                            if inv_file and inv_file.exists():
+                                self.inventory_path.set(str(inv_file))
+                                self._log_scheduler(f"Loaded B2B file: {inv_file.name}")
+                            if ts_file and ts_file.exists():
+                                self.time_sheet_path.set(str(ts_file))
+                                self._log_scheduler(f"Loaded timesheet: {ts_file.name}")
+                            # Require both files to call load_variances (avoids missing-file dialog).
+                            both_ready = (
+                                inv_file and inv_file.exists() and
+                                ts_file and ts_file.exists()
+                            )
+                            if both_ready:
+                                self.load_variances()
+                                self._auto_import_stores_from_inventory()
+
+                            # Send starting message + status image for every fired district.
+                            # This is the ONLY place starting messages send — after export attempt.
+                            fired = list(getattr(self, "_scheduler_fired_districts", set()))
+                            pending = getattr(self, "_scheduler_pending_messages", None)
+                            if pending is None:
+                                self._scheduler_pending_messages = set(fired)
+                                pending = self._scheduler_pending_messages
+                            unsent = [d for d in fired if d in pending]
+                            if unsent:
+                                # One thread sends all districts sequentially — no concurrent UI fight
+                                # (critical for desktop mode; web mode also benefits from sequential tab use).
+                                for d in unsent:
+                                    self._log_scheduler(f"💬 Sending starting message → {d}")
+                                normalized = [normalize_district(d) for d in unsent]
+                                threading.Thread(
+                                    target=self._send_starting_message_thread,
+                                    args=(normalized,),
+                                    daemon=True,
+                                    name="StartingMessages",
+                                ).start()
+                                for d in unsent:
+                                    if both_ready:
+                                        self._auto_send_status_image(d)
+                                    pending.discard(d)
+
+                            if _district_for_send:
+                                self._auto_send_variance_image(_district_for_send)
+                        except Exception as exc:
+                            self._log_scheduler(f"⚠ Reload error: {exc}")
+                    self.after(0, _reload_and_send)
+            except Exception as exc:
+                # A scraper _make_driver() failure used to kill this thread
+                # BEFORE the finally below ran, leaking the export-cycle lock —
+                # every later cycle then logged "already running" and silently
+                # skipped for the rest of the session.
+                self.after(0, lambda e=exc: self._log_scheduler(f"⚠ Export cycle error: {e}"))
+            finally:
+                _BROWSER_LOCK.release()
                 _lock = getattr(self, "_export_cycle_lock", None)
                 if _lock is not None:
                     try:
@@ -8785,6 +8956,17 @@ class GFHApp(tk.Tk):
             self.clear_current_ui(silent=True)
             self.set_status("Reading Excel files...")
             inv_records = read_xlsx_records(inventory)
+            # Today-only fallback (user rule): when the downloaded file is
+            # NOT today-only (date-range dropdown missed → Month-to-Date
+            # export), keep just today's details from the sheet — otherwise
+            # one employee shows up at every store he counted this month.
+            inv_records, _today_m = filter_inventory_rows_to_today(
+                inv_records, source_name=os.path.basename(inventory))
+            if _today_m.get("today_filter_mode") != "off":
+                self._log_scheduler(
+                    f"[Today filter] {_today_m['today_rows_dropped']} row(s) not dated "
+                    f"{_today_m['today_target_date']} dropped from {os.path.basename(inventory)} "
+                    f"(export was not Today-only — using today's details only).")
             ts_records = read_xlsx_records(time_sheet)
             self.current_inventory_records = inv_records
             self.current_time_sheet_records = ts_records
