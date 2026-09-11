@@ -1,0 +1,8 @@
+GFH Audit Automation - build info
+generated:       2026-09-03 16:39:57
+version:         1.2.2
+frozen exe:      False
+running from:    python main.py (source)
+gfh_icon.ico:    /home/z/my-project/repos/GFH-Audit-Automation/gfh_icon.ico
+logo png:        /home/z/my-project/repos/GFH-Audit-Automation/GFH_Telecom_Logo.png
+window icon set: True
