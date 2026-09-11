@@ -122,3 +122,49 @@ def test_get_body_has_local_by_import():
     fn_src = _function_src(_read(), "_b2b_get_body")
     assert re.search(r"def _b2b_get_body\(driver\)[^\n]*:\n\s+from selenium.webdriver.common.by import By", fn_src), \
         "_b2b_get_body must import By locally (bare except used to swallow the NameError)"
+
+
+# ── Round 3: extractor signin wiring (2026-09-11) ───────────────────────────
+
+def _method_src(src, name):
+    """Extract an indented class-method source (login/_is_authed are methods
+    of B2BSoftScraper — the module-level _function_src regex cannot see them)."""
+    m = re.search(rf"\n    def {name}\(.*?(?=\n    def |\n# |\Z)", src, re.S)
+    assert m, f"method {name} not found"
+    return m.group(0)
+
+
+def test_login_has_warm_session_fast_path():
+    """Extractor behavior: a persistent profile keeps the portal signed in, so
+    login() must detect an authenticated portal and skip the whole sign-in —
+    it used to charge into the SSO steps and die waiting for #companyId."""
+    login = _method_src(_read(), "login")
+    assert "Portal session already active" in login
+    assert "self._is_authed()" in login
+    # requires the authed reading to hold on consecutive polls (no SPA false positive)
+    assert "_warm_hits >= 2" in login
+
+
+def test_is_authed_rejects_blank_or_login_body():
+    fn_src = _method_src(_read(), "_is_authed")
+    # half-rendered SPA has an (near-)empty body — must not count as authed
+    assert "len(body_text.strip()) < 40" in fn_src
+    # login-form wording in the body disqualifies even without the known ids
+    for marker in ("access code", "company id", "user name", "password"):
+        assert marker in fn_src
+
+
+def test_submit_credentials_tries_sign_in_first():
+    """vidapay-extractor login_store clicks the plain 'Sign In' button on this
+    vendor's SSO credentials page daily — it is attempt #1, before #btnClick."""
+    login = _method_src(_read(), "login")
+    signin_pos = login.find('("Sign In button", {"text_contains": "sign in", "timeout": 8})')
+    btnclick_pos = login.find('("#btnClick verify button"')
+    assert signin_pos != -1, "Sign In primary missing"
+    assert btnclick_pos != -1, "#btnClick fallback missing"
+    assert signin_pos < btnclick_pos, "Sign In must be tried before #btnClick"
+
+
+def test_login_documented_as_extractor_wiring():
+    src = _read()
+    assert "vidapay-extractor" in src

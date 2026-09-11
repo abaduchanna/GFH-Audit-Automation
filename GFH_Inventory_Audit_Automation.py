@@ -4092,16 +4092,12 @@ def _is_edge_port_open(port: int = EDGE_DEBUG_PORT, timeout: float = 1.0) -> boo
         return False
 
 
-def _ensure_edge_open(port: int = EDGE_DEBUG_PORT, log=None) -> bool:
-    """Launch Edge at debug port using GFH automation profile if not already running."""
-    if _is_edge_port_open(port):
-        return True
+def _launch_edge_debug(port: int = EDGE_DEBUG_PORT, url: str = "about:blank") -> None:
+    """Start Edge at the debug port with the GFH automation profile (real window)."""
+    import subprocess as _sp
     edge_exe = _get_edge_exe()
     if not edge_exe:
-        if log:
-            log("⚠ Microsoft Edge not found — install Edge and retry.")
-        return False
-    import subprocess as _sp
+        return
     os.makedirs(GFH_AUTOMATION_PROFILE_DIR, exist_ok=True)
     _sp.Popen([
         edge_exe,
@@ -4110,14 +4106,84 @@ def _ensure_edge_open(port: int = EDGE_DEBUG_PORT, log=None) -> bool:
         "--profile-directory=Default",
         "--no-first-run",
         "--no-default-browser-check",
-        "about:blank",
+        url,
     ])
-    for _ in range(20):  # wait up to 10 s
-        time.sleep(0.5)
+
+
+def _wait_edge_port(port: int = EDGE_DEBUG_PORT, seconds: float = 15.0) -> bool:
+    deadline = time.time() + seconds
+    while time.time() < deadline:
         if _is_edge_port_open(port):
             return True
+        time.sleep(0.5)
+    return False
+
+
+def _kill_stale_profile_edge(port: int = EDGE_DEBUG_PORT, log=None) -> int:
+    """Kill leftover msedge processes holding the automation profile WITHOUT the
+    debug port (a launch lost its flags — e.g. first-run hand-off). When such a
+    stale instance is running, a new Popen with --remote-debugging-port merely
+    opens a window in the OLD process and the port never opens: every later
+    attach fails until the machine reboots. Only processes whose command line
+    contains OUR profile dir are touched — the user's personal Edge is safe."""
+    if os.name != "nt":
+        return 0
+    try:
+        import subprocess as _sp
+        marker = GFH_AUTOMATION_PROFILE_DIR
+        ps = (
+            "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
+            "Where-Object { $_.CommandLine -like '*" + marker + "*' } | "
+            "Select-Object -ExpandProperty ProcessId"
+        )
+        out = _sp.run(["powershell", "-NoProfile", "-Command", ps],
+                      capture_output=True, text=True, timeout=20)
+        pids = [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip().isdigit()]
+        if not pids:
+            return 0
+        for pid in pids:
+            _sp.run(["taskkill", "/F", "/PID", pid],
+                    capture_output=True, text=True, timeout=15)
+        if log:
+            log(f"Killed {len(pids)} stale automation-Edge process(es) that held the profile "
+                "without the debug port — relaunching.")
+        time.sleep(2)
+        return len(pids)
+    except Exception:
+        return 0
+
+
+def _ensure_edge_open(port: int = EDGE_DEBUG_PORT, log=None) -> bool:
+    """Launch Edge at debug port using GFH automation profile if not already running.
+
+    Recovery ladder (mirrors vidapay-extractor's VPN-browser setup): wait longer
+    for a slow first launch, relaunch once, then clear a stale profile-holding
+    instance that swallowed the debug flags and relaunch again."""
+    if _is_edge_port_open(port):
+        return True
+    if not _get_edge_exe():
+        if log:
+            log("⚠ Microsoft Edge not found — install Edge and retry.")
+        return False
+    _launch_edge_debug(port)
+    if _wait_edge_port(port, seconds=15):
+        return True
+    # Second launch attempt (first-launch hand-off races eat the flags).
+    _launch_edge_debug(port)
+    if _wait_edge_port(port, seconds=8):
+        if log:
+            log("Edge debug port came up on the second launch attempt.")
+        return True
+    # A stale instance of THIS profile is running without the debug port —
+    # every new launch joins it and the port never opens. Clear and relaunch.
+    if _kill_stale_profile_edge(port, log=log):
+        _launch_edge_debug(port)
+        if _wait_edge_port(port, seconds=10):
+            if log:
+                log("Edge relaunched with the debug port after clearing the stale instance.")
+            return True
     if log:
-        log("⚠ Edge launched but port 9227 not ready — wait and retry.")
+        log(f"⚠ Edge launched but debug port {port} never opened — close automation Edge windows and retry.")
     return False
 
 
@@ -4130,31 +4196,122 @@ def _edge_debug_driver(port: int = EDGE_DEBUG_PORT):
     return webdriver.Edge(options=opts)
 
 
-# Tabs that Edge starts with and that are safe to REUSE for a real page
-# (the automation Edge is launched with a about:blank start tab — navigating
-# it beats spawning a second tab and leaving the empty window in front).
-_BLANK_TAB_URLS = ("about:blank", "edge://newtab", "data:,")
+# Browser-internal surfaces (Downloads flyout, new-tab page, DevTools,
+# extensions). Selenium attaching to one of these is the classic Edge failure
+# mode vidapay-extractor's tab stack works around — they must never be treated
+# as reusable content tabs.
+_BROWSER_CHROME_PREFIXES = (
+    "edge://", "chrome://", "devtools://",
+    "edge-extension://", "chrome-extension://", "view-source:",
+)
+
+# Tabs that are safe to REUSE for a real page (the automation Edge starts on
+# about:blank — navigating it beats spawning a second tab).
+_BLANK_TAB_URLS = ("about:blank", "edge://newtab", "edge://new-tab-page", "data:,")
 
 
-def _find_or_open_tab(driver, url: str) -> None:
-    """Switch to existing tab on the same origin as url; open a new tab if absent.
+def _is_browser_chrome_url(url: str) -> bool:
+    return (url or "").lower().strip().startswith(_BROWSER_CHROME_PREFIXES)
 
-    A leftover blank/new-tab tab (Edge starts on about:blank) is NAVIGATED to
-    the target URL instead of spawning an extra tab, so the automation window
-    shows the real page rather than an empty about:blank tab in front."""
+
+def _get_driver_handles(driver) -> list:
+    try:
+        return list(driver.window_handles)
+    except Exception:
+        return []
+
+
+def _switch_to_first_live_content_tab(driver, log=None) -> bool:
+    """Port of vidapay-extractor switch_to_first_live_content_tab: land on a
+    real web tab, skipping edge:// / chrome:// / devtools surfaces."""
+    fallback = None
+    for handle in _get_driver_handles(driver):
+        try:
+            driver.switch_to.window(handle)
+            cur = ""
+            try:
+                cur = driver.current_url or ""
+            except Exception:
+                cur = ""
+            if fallback is None:
+                fallback = handle
+            if cur and not _is_browser_chrome_url(cur):
+                return True
+        except Exception:
+            continue
+    if fallback is not None:
+        try:
+            driver.switch_to.window(fallback)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _open_real_edge_tab(url: str = "about:blank") -> None:
+    """Open a REAL normal tab via the OS (extractor open_edge_url_in_real_tab).
+    Never attaches Selenium to UI surfaces; used as the last tab-recovery tier."""
+    try:
+        _launch_edge_debug(url=url)
+    except Exception:
+        pass
+
+
+def _harden_attached_driver(driver, log=None) -> bool:
+    """Post-attach hardening, ported from vidapay-extractor:
+    1. Mask navigator.webdriver/plugins and CDP-inject it before every page —
+       Cloudflare reads these and escalates/hard-blocks flagged browsers, which
+       is a big reason opening b2b 'often fails'.
+    2. Verify Selenium sits on a real content tab (not a UI surface) —
+       recovering with the tab ladder when it does not.
+    Returns True when a usable content tab is selected."""
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined, configurable: true});
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5], configurable: true});
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'], configurable: true});
+                window.chrome = { runtime: {} };
+            """
+        })
+    except Exception:
+        pass
+    ok = _switch_to_first_live_content_tab(driver, log=log)
+    if not ok and log:
+        log("⚠ Attached to Edge but no usable content tab — Downloads flyout or UI surface may be focused.")
+    return ok
+
+
+def _find_or_open_tab(driver, url: str, log=None) -> None:
+    """Switch to an existing tab on url's origin; open one when absent.
+
+    Recovery ladder ported from vidapay-extractor (open_url_in_edge_tab /
+    open_blank_normal_tab) — each tier fixes a different real-world failure:
+      1. Same-origin tab exists        → switch to it (normal path)
+      2. Blank/new-tab surface exists  → navigate it to the URL
+      3. switch_to.new_window('tab')   → recovers 'target closed' sessions
+      4. CDP Target.createTarget       → recovers when window.open is blocked
+      5. OS-level real Edge tab        → recovers when the browser rejected
+                                          every in-process creation
+    """
     from urllib.parse import urlparse
     parsed = urlparse(url)
     origin = f"{parsed.scheme}://{parsed.netloc}"
+    handles = _get_driver_handles(driver)
     blank_handle = None
-    for handle in driver.window_handles:
+    for handle in handles:
         try:
             driver.switch_to.window(handle)
             cur = driver.current_url
         except Exception:
             continue
-        if cur.startswith(origin):
+        if cur and cur.startswith(origin):
             return
-        if blank_handle is None and any(cur == b or cur.startswith(b) for b in _BLANK_TAB_URLS):
+        if blank_handle is None and not _is_browser_chrome_url(cur) and (
+                any(cur == b or cur.startswith(b) for b in _BLANK_TAB_URLS)):
             blank_handle = handle
     if blank_handle is not None:
         try:
@@ -4163,8 +4320,54 @@ def _find_or_open_tab(driver, url: str) -> None:
             return
         except Exception:
             pass
-    driver.execute_script("window.open(arguments[0], '_blank');", url)
-    driver.switch_to.window(driver.window_handles[-1])
+    # Tier 3: a fresh tab in the same window.
+    try:
+        driver.switch_to.new_window("tab")
+        time.sleep(0.4)
+        driver.get(url)
+        if log:
+            log("Opened a new Edge tab for the page (window recovery).")
+        return
+    except Exception:
+        pass
+    # Tier 4: DevTools target creation.
+    try:
+        before = set(_get_driver_handles(driver))
+        driver.execute_cdp_cmd("Target.createTarget", {"url": url})
+        time.sleep(1)
+        new = [h for h in _get_driver_handles(driver) if h not in before]
+        for handle in reversed(new or _get_driver_handles(driver)):
+            try:
+                driver.switch_to.window(handle)
+                if log:
+                    log("Opened the page via DevTools target (window.open was blocked).")
+                return
+            except Exception:
+                continue
+    except Exception:
+        pass
+    # Tier 5: real OS tab through the automation profile.
+    _open_real_edge_tab(url)
+    time.sleep(2)
+    for handle in _get_driver_handles(driver):
+        try:
+            driver.switch_to.window(handle)
+            cur = driver.current_url or ""
+        except Exception:
+            continue
+        if cur.startswith(origin):
+            if log:
+                log("Opened the page in a real Edge tab (OS-level recovery).")
+            return
+    # Same-origin tab never appeared — leave Selenium on any live content tab
+    # and navigate it directly as a final attempt.
+    _switch_to_first_live_content_tab(driver, log=log)
+    try:
+        driver.get(url)
+    except Exception:
+        pass
+    if log:
+        log(f"⚠ Tab for {origin} could not be confirmed — navigated the current tab instead.")
 
 
 def _humanize_list(items: list) -> str:
@@ -4176,24 +4379,42 @@ def _humanize_list(items: list) -> str:
     return ", ".join(items[:-1]) + ", and " + items[-1]
 
 
-def open_monitoring_tabs(port: int = EDGE_DEBUG_PORT, include_whatsapp: bool = True) -> list:
+def open_monitoring_tabs(port: int = EDGE_DEBUG_PORT, include_whatsapp: bool = True,
+                         log=None) -> list:
     """Open B2B, GFH app (and optionally WhatsApp Web) tabs in Edge at debug port.
 
     Returns the list of tab names that are now open. WhatsApp Web is only
     opened when include_whatsapp is True (i.e. WhatsApp Web mode is selected);
     with WhatsApp Desktop mode only B2B and GFH app tabs are opened.
-    """
+
+    Failures are LOGGED (previously swallowed by a bare except — the scheduler
+    never showed why tabs were missing) and retried once after re-launching
+    the automation Edge with the extractor's recovery ladder."""
+    targets = [(_B2B_URL, "B2B"), (_GFH_APP_URL, "GFH app")]
+    if include_whatsapp:
+        targets.append((_WA_URL, "WhatsApp Web"))
+
     opened: list = []
-    try:
-        driver = _edge_debug_driver(port)
-        for url, name in ((_B2B_URL, "B2B"), (_GFH_APP_URL, "GFH app")):
-            _find_or_open_tab(driver, url)
-            opened.append(name)
-        if include_whatsapp:
-            _find_or_open_tab(driver, _WA_URL)
-            opened.append("WhatsApp Web")
-    except Exception:
-        pass
+    for attempt in (1, 2):
+        try:
+            driver = _edge_debug_driver(port)
+            _harden_attached_driver(driver, log=log)
+            opened = []
+            for url, name in targets:
+                try:
+                    _find_or_open_tab(driver, url, log=log)
+                    opened.append(name)
+                except Exception as exc:
+                    if log:
+                        log(f"⚠ Could not open the {name} tab: {exc}")
+            if opened:
+                return opened
+        except Exception as exc:
+            if log:
+                log(f"⚠ Tab-open attempt {attempt} failed: {exc}")
+        if attempt == 1 and log:
+            log("Retrying tab setup after re-launching the automation Edge…")
+            _ensure_edge_open(port, log=log)
     return opened
 
 
@@ -4243,11 +4464,12 @@ class B2BSoftScraper:
         # Try user's running Edge profile first (port 9227)
         try:
             self.driver = _edge_debug_driver()
+            _harden_attached_driver(self.driver, log=self.log)
             self.driver.execute_cdp_cmd("Page.setDownloadBehavior", {
                 "behavior": "allow",
                 "downloadPath": str(self.download_dir),
             })
-            _find_or_open_tab(self.driver, _B2B_URL)
+            _find_or_open_tab(self.driver, _B2B_URL, log=self.log)
             self._using_debug_port = True
             return
         except Exception:
@@ -4296,15 +4518,41 @@ class B2BSoftScraper:
             self._make_driver()
         self.download_dir.mkdir(parents=True, exist_ok=True)
         # Switch to B2B tab before navigating — prevents overwriting another scraper's tab.
-        _find_or_open_tab(self.driver, self.PORTAL_URL)
+        _find_or_open_tab(self.driver, self.PORTAL_URL, log=self.log)
         self.log(f"Opening {self.PORTAL_URL}")
-        self.driver.get(self.PORTAL_URL)
+        try:
+            self.driver.get(self.PORTAL_URL)
+        except Exception:
+            pass  # SPA reloads race the page-load timeout — the state checks below decide
         time.sleep(2)
 
         # Clear any initial verification challenge
         if _b2b_is_human_verification_page(self.driver):
             if not _b2b_wait_for_human_verification_clear(self.driver, stop_event=stop_event, log=self.log):
                 raise RuntimeError("Cloudflare/reCAPTCHA challenge on landing page was not resolved.")
+
+        # ── Warm-session fast path (extractor behavior) ─────────────────────
+        # The extractor never needs an Access Code because its browser keeps
+        # the signed-in session alive between runs. This profile does too —
+        # but login() used to charge into the SSO steps anyway and died at
+        # Step 1 waiting for #companyId that never renders on an
+        # already-authenticated portal. Poll briefly for an authenticated
+        # portal and skip the entire sign-in when it is (the session must
+        # hold across two consecutive polls so a half-rendered SPA is not
+        # mistaken for a login).
+        _warm_deadline = time.time() + 8
+        _warm_hits = 0
+        while time.time() < _warm_deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if self._is_authed():
+                _warm_hits += 1
+                if _warm_hits >= 2:
+                    self.log("Portal session already active — skipping sign-in (extractor behavior).")
+                    return True
+            else:
+                _warm_hits = 0
+            time.sleep(1)
 
         wait = WebDriverWait(self.driver, 30)
         drv = self.driver
@@ -4920,16 +5168,18 @@ class B2BSoftScraper:
             self.log("Password entered.")
 
         def _submit_credentials() -> bool:
-            # Same button-matching chain as vidapay-extractor: the SSO
-            # sign-in button is force-enabled and clicked via JS (native
-            # click first, MouseEvent fallback). "Next" first — that is the
-            # button the SSO sign-in page actually shows. Waits are short:
-            # the generic password-form submit below covers anything these
-            # miss, so a wrong guess no longer burns half a minute.
+            # Submit chain — the vidapay-extractor's PROVEN primary goes first:
+            # its login_store daily-drives this vendor's SSO credentials page
+            # with a plain '//button[Sign In]' click, so that is attempt #1
+            # here too (8s window, native click with JS fallback inside
+            # _b2b_click_button). #btnClick and the other text variants stay
+            # as fallbacks; the generic password-form submit below covers
+            # anything they all miss, so a wrong guess no longer burns half
+            # a minute.
             for _btn_label, kwargs in [
-                ("#btnClick verify button", {"button_id": "btnClick", "timeout": 4}),
+                ("Sign In button", {"text_contains": "sign in", "timeout": 8}),
+                ("#btnClick verify button", {"button_id": "btnClick", "timeout": 3}),
                 ("Next button", {"text_contains": "next", "timeout": 2}),
-                ("Sign In button", {"text_contains": "sign in", "timeout": 2}),
                 ("Log In button", {"text_contains": "log in", "timeout": 2}),
                 ("Login button", {"text_contains": "login", "timeout": 2}),
                 ("Continue button", {"text_contains": "continue", "timeout": 2}),
@@ -5100,6 +5350,13 @@ class B2BSoftScraper:
                 return False
             body_text = (self.driver.find_element(By.TAG_NAME, "body").text or "").lower()
             if "new sign in" in body_text or "2-factor" in body_text:
+                return False
+            # A half-rendered SPA has an (near-)empty body — without this guard
+            # the warm-session fast path in login() would skip sign-in on a
+            # page that was still loading the login form.
+            if len(body_text.strip()) < 40:
+                return False
+            if any(m in body_text for m in ("access code", "company id", "user name", "password")):
                 return False
             # No login fields present and on B2B domain → treat as authenticated
             return True
@@ -5391,11 +5648,12 @@ class TimesheetScraper:
         # Try user's running Edge profile first (port 9227)
         try:
             self.driver = _edge_debug_driver()
+            _harden_attached_driver(self.driver, log=self.log)
             self.driver.execute_cdp_cmd("Page.setDownloadBehavior", {
                 "behavior": "allow",
                 "downloadPath": str(self.download_dir),
             })
-            _find_or_open_tab(self.driver, _GFH_APP_URL)
+            _find_or_open_tab(self.driver, _GFH_APP_URL, log=self.log)
             self._using_debug_port = True
             return
         except Exception:
@@ -6511,7 +6769,7 @@ class GFHApp(tk.Tk):
             include_wa = (mode_var.get() == "web") if mode_var is not None else True
         except Exception:
             include_wa = True
-        return open_monitoring_tabs(include_whatsapp=include_wa)
+        return open_monitoring_tabs(include_whatsapp=include_wa, log=self._log_scheduler)
 
     def _log_tabs_opened(self, names: list) -> None:
         """Log 'Opened X, Y tabs.' — suppresses exact repeats within 90s so the

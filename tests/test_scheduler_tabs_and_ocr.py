@@ -60,7 +60,7 @@ def test_scheduler_opens_tabs_mode_aware_and_logs():
     startup = _get_source("_startup_sequence") if False else None
     # _startup_sequence is nested; check it via raw source
     assert '_sched_open_tabs()' in SRC
-    assert '_humanize_list(names) + " tabs."' in SRC
+    assert '_humanize_list(list(names)) + " tabs."' in SRC
 
 
 def test_old_ts_tab_message_gone():
@@ -177,10 +177,14 @@ def test_find_or_open_tab_reuses_blank_tab():
 def test_b2b_handles_sso_company_id_stage():
     login = _get_source("login")
     # The SSO login page shows ONLY #companyId (+ Edit/Clear/Submit) first;
-    # the flow must submit it before Username/Password can appear.
+    # the flow must submit it before Username/Password can appear. Current
+    # log wording: "SSO Access Code page — <label> submitted via <how>".
     assert "sso_submits" in login
-    assert "SSO company-ID page — company ID submitted" in login
-    assert "sso_submits < 3" in login
+    assert "SSO Access Code page" in login
+    assert "sso_submits >= 4" in login
+    # requestSubmit is attempt #1 (measured: click/ENTER produced no network
+    # activity while form.requestSubmit() POSTed to /Account/LoginCompany).
+    assert '"rsubmit", "submit", "enter", "formsubmit"' in login
     # types the company ID into the SSO field when its value differs
     assert 'get_attribute("value")' in login
     # step-1 transition wait breaks early once sso.b2bsoft.com is reached
@@ -193,3 +197,50 @@ def test_ocr_entry_logs_on_main_thread():
     assert "self.after(0" in src
     # no direct widget access from the background thread
     assert "self._log_scheduler(" not in src.replace("lambda mm=str(m): self._log_scheduler(mm)", "")
+
+
+# ── 6. Round 3: extractor-grade tab reliability (2026-09-11) ────────────────
+
+def test_find_or_open_tab_has_full_recovery_ladder():
+    """The old implementation only had same-origin switch + blank reuse +
+    window.open. vidapay-extractor's ladder adds a new-window attempt, CDP
+    Target.createTarget, and an OS-level real Edge tab as final tiers."""
+    src = _get_source("_find_or_open_tab")
+    assert "switch_to.new_window" in src
+    assert "Target.createTarget" in src
+    assert "_open_real_edge_tab" in src
+    # browser-internal surfaces (Downloads flyout etc.) are never reused
+    assert "_is_browser_chrome_url" in src
+
+
+def test_harden_attached_driver_masks_automation_flags():
+    """Cloudflare reads navigator.webdriver and hardens challenges against
+    flagged browsers — the attach path must CDP-inject the mask like the
+    vidapay-extractor does, and every scraper attach goes through it."""
+    src = _get_source("_harden_attached_driver")
+    assert "addScriptToEvaluateOnNewDocument" in src
+    assert "navigator" in src and "webdriver" in src
+    assert "_switch_to_first_live_content_tab" in src
+    # def + B2BScraper + TimesheetScraper + open_monitoring_tabs call sites
+    assert SRC.count("_harden_attached_driver(") >= 4
+
+
+def test_open_monitoring_tabs_logs_and_retries():
+    """Tab failures used to vanish into a bare `except: pass` — they must be
+    logged, with one retry after re-running the Edge launch ladder."""
+    src = _get_source("open_monitoring_tabs")
+    assert "log(" in src
+    assert "_ensure_edge_open(port, log=log)" in src
+    assert "include_whatsapp" in src and '"B2B"' in src and '"GFH app"' in src
+
+
+def test_ensure_edge_open_clears_stale_profile_instance():
+    """A leftover automation-profile Edge WITHOUT the debug port swallows
+    every relaunch (new windows join the old process, port never opens).
+    The launcher must detect and clear exactly that instance."""
+    kill = _get_source("_kill_stale_profile_edge")
+    assert "GFH_AUTOMATION_PROFILE_DIR" in kill
+    assert "msedge.exe" in kill
+    ensure = _get_source("_ensure_edge_open")
+    assert "_kill_stale_profile_edge" in ensure
+    assert "_launch_edge_debug" in ensure
