@@ -6044,12 +6044,11 @@ class AuditScheduler:
 
     def _run_loop(self, district_times: dict, stop_time=None) -> None:
         import datetime as _dt
-        # fired[district] = {"start_ts": float, "export_done": bool, "reminders_sent": int, "final_sent": bool}
+        # fired[district] = {"start_ts": float, "export_done": bool, "final_sent": bool}
         fired: dict = {}
         last_reextract: float = time.time()  # init to now so first re-extract waits full RE_EXTRACT_SEC
         INITIAL_EXPORT_SEC = 15 * 60   # 15 min after district starts
-        RE_EXTRACT_SEC = 30 * 60       # re-extract B2B + GFH every 30 min
-        REMINDER_DELAYS = [30 * 60, 60 * 60, 90 * 60]  # 30, 60, 90 min after start
+        RE_EXTRACT_SEC = 15 * 60       # re-extract B2B + GFH every 15 min
 
         while not self._stop_event.is_set():
             self._hold_event.wait()
@@ -6080,10 +6079,12 @@ class AuditScheduler:
                             continue
                     except Exception:
                         pass
-                fired[district] = {"start_ts": now_ts, "export_done": False, "reminders_sent": 0, "final_sent": False}
+                fired[district] = {"start_ts": now_ts, "export_done": False, "final_sent": False}
                 self.app.after(0, lambda d=district: self.app._scheduler_start_district(d))
 
-            # Per-district: initial export at 15 min, then reminders at 30/60/90 min
+            # Per-district: initial export + variance image at 15 min.
+            # (Auto-reminders removed — the flow is start text → status →
+            # 15-min variance image → final at end time.)
             for district, state in list(fired.items()):
                 elapsed = now_ts - state["start_ts"]
 
@@ -6092,21 +6093,7 @@ class AuditScheduler:
                     state["export_done"] = True
                     self.app.after(0, lambda d=district: self.app._scheduler_run_export_cycle(district=d))
 
-                # Reminders at 30, 60, 90 min
-                reminders_sent = state.get("reminders_sent", 0)
-                for i, delay in enumerate(REMINDER_DELAYS):
-                    if reminders_sent <= i and elapsed >= delay:
-                        state["reminders_sent"] = i + 1
-                        reminder_num = i + 1
-                        self.app.after(0, lambda d=district, r=reminder_num: self.app._auto_send_reminder(d, r))
-                        break
-
-                # Final result at reminder 3 + 30 min (t+120 min) if not yet sent
-                if not state.get("final_sent") and elapsed >= 120 * 60:
-                    state["final_sent"] = True
-                    self.app.after(0, lambda d=district: self.app._auto_send_final_result(d))
-
-            # Global re-extract B2B + GFH every 30 min (only after at least one district started)
+            # Global re-extract B2B + GFH every 15 min (only after at least one district started)
             if fired and (now_ts - last_reextract) >= RE_EXTRACT_SEC:
                 self.app.after(0, self.app._scheduler_run_export_cycle)
                 last_reextract = now_ts
@@ -6820,7 +6807,8 @@ class GFHApp(tk.Tk):
                     adjusted_times[district] = t
             else:
                 adjusted_times[district] = t
-        # Compute stop time: explicit global stop time overrides duration
+        # End time: the schedule's end — final message sends to every started
+        # district at this moment. Empty means run until Stop is pressed.
         stop_time_str = self._sched_stop_time_var.get().strip()
         stop_time = None
         if stop_time_str:
@@ -6833,12 +6821,6 @@ class GFHApp(tk.Tk):
                     stop_time += _dt.timedelta(days=1)
             except Exception:
                 pass
-        if stop_time is None:
-            try:
-                dur_h = float(self._sched_duration_var.get().strip() or "12")
-            except Exception:
-                dur_h = 12.0
-            stop_time = now + _dt.timedelta(hours=dur_h)
         # Tracks districts whose scheduled start has fired this session.
         self._scheduler_fired_districts: set = set()
         # Tracks districts whose starting message has not yet been sent.
@@ -6847,7 +6829,12 @@ class GFHApp(tk.Tk):
         self._export_cycle_lock = threading.Lock()
 
         self._scheduler.start(adjusted_times, stop_time=stop_time)
-        self._log_scheduler(f"▶ Started. Stops at {stop_time.strftime('%H:%M')}.")
+        if stop_time is not None:
+            self._log_scheduler(
+                f"▶ Started. End time {stop_time.strftime('%I:%M %p').lstrip('0')} — "
+                "final message goes to all districts then.")
+        else:
+            self._log_scheduler("▶ Started. No end time set — runs until Stop.")
         # Start WhatsApp notification OCR monitor for auto-IMEI clearing
         self._start_whatsapp_ocr_monitor()
 
@@ -6986,6 +6973,9 @@ class GFHApp(tk.Tk):
                         brs.login()
                         brs.navigate_to_report()
                         inv_file = brs.download_xlsx()
+                        if inv_file and inv_file.exists():
+                            self.after(0, lambda f=inv_file: self._log_scheduler(
+                                f"✓ B2B file downloaded ({f.name}) — tab left open."))
                     except Exception as exc:
                         # NOTE: bind exc via default arg — `except ... as exc`
                         # deletes the name at block exit, and this lambda runs
@@ -7000,6 +6990,9 @@ class GFHApp(tk.Tk):
                     try:
                         ts.login()
                         ts_file = ts.download_xlsx()
+                        if ts_file and ts_file.exists():
+                            self.after(0, lambda f=ts_file: self._log_scheduler(
+                                f"✓ Timesheet file downloaded ({f.name}) — tab left open."))
                     except Exception as exc:
                         self.after(0, lambda e=exc: self._log_scheduler(f"⚠ Timesheet export error: {e}"))
                     finally:
@@ -7064,6 +7057,13 @@ class GFHApp(tk.Tk):
 
                             if _district_for_send:
                                 self._auto_send_variance_image(_district_for_send)
+                            else:
+                                # Global 15-min re-extract (district=None): refresh
+                                # the variance image for EVERY started district,
+                                # one by one. Districts with nothing pending are
+                                # skipped inside _auto_send_variance_image.
+                                for d in sorted(getattr(self, "_scheduler_fired_districts", set())):
+                                    self._auto_send_variance_image(d)
                         except Exception as exc:
                             self._log_scheduler(f"⚠ Reload error: {exc}")
                     self.after(0, _reload_and_send)
@@ -7500,19 +7500,19 @@ class GFHApp(tk.Tk):
         ttk.Label(btn_row, text="  Start times per district (HH:MM AM/PM):",
                   foreground="#8090b0").pack(side="left", padx=(12, 4))
 
-        # Duration and global stop time row
+        # End time row (the schedule's end — the final message goes to every
+        # started district at this time). No duration fallback: empty means the
+        # scheduler runs until Stop is pressed.
         dur_row = ttk.Frame(sched_box)
         dur_row.pack(fill="x", pady=(2, 4))
-        ttk.Label(dur_row, text="Duration (hrs):").pack(side="left", padx=(0, 4))
-        self._sched_duration_var = tk.StringVar(value="12")
-        ttk.Entry(dur_row, textvariable=self._sched_duration_var, width=6).pack(side="left", padx=(0, 12))
-        ttk.Label(dur_row, text="Global stop time:").pack(side="left", padx=(0, 4))
+        ttk.Label(dur_row, text="End time:").pack(side="left", padx=(0, 4))
         self._sched_stop_time_var = tk.StringVar(value="")
         ttk.Entry(dur_row, textvariable=self._sched_stop_time_var, width=7).pack(side="left", padx=(0, 2))
         self._sched_stop_ampm_var = tk.StringVar(value="PM")
         ttk.Combobox(dur_row, textvariable=self._sched_stop_ampm_var, values=["AM", "PM"],
                      state="readonly", width=4).pack(side="left", padx=(0, 4))
-        ttk.Label(dur_row, text="HH:MM AM/PM — overrides duration when set", foreground="#8090b0").pack(side="left")
+        ttk.Label(dur_row, text="HH:MM AM/PM — final message sends to all districts at this time",
+                  foreground="#8090b0").pack(side="left")
 
         # District time inputs (compact, inline)
         self._sched_frame = ttk.Frame(sched_box)
