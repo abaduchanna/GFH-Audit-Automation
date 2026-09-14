@@ -3014,37 +3014,159 @@ def _b2b_pyautogui_click_turnstile(driver, log=print) -> bool:
     return False
 
 
-def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
-    """Solve reCAPTCHA v2 via Google STT audio challenge (with Whisper fallback)."""
-    import shutil, subprocess, tempfile
+def _b2b_ensure_pip_package(package_import, pip_name, log=print) -> bool:
+    """Frozen-safe dependency check. NEVER pass sys.executable to pip here —
+    in the packaged EXE sys.executable IS the automation app itself, so
+    `-m pip install` would RELAUNCH a second copy of the automation (the
+    "reCAPTCHA opens another app" bug). _pip_cmd() (frozen-aware) is used
+    instead, and packaged builds bundle the dependency anyway."""
     try:
-        import speech_recognition as sr
+        __import__(package_import)
+        return True
     except ImportError:
-        try:
-            subprocess.run([sys.executable, "-m", "pip", "install", "SpeechRecognition",
-                            "--quiet", "--disable-pip-version-check"], capture_output=True, timeout=90)
-            import speech_recognition as sr
-        except Exception:
-            log("  SpeechRecognition not available — cannot solve reCAPTCHA audio.")
-            return False
-
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        log("  ffmpeg not found — cannot convert audio for reCAPTCHA.")
+        pass
+    try:
+        _pip = _pip_cmd()
+    except Exception:
+        _pip = None
+    if not _pip:
+        log(f"  {pip_name} is not bundled in this packaged app and no system "
+            "Python was found for pip — cannot install it.")
+        return False
+    log(f"  Installing {pip_name}...")
+    try:
+        subprocess.run(
+            list(_pip) + ["install", pip_name, "--quiet",
+                          "--disable-pip-version-check"],
+            capture_output=True, timeout=120,
+        )
+        __import__(package_import)
+        return True
+    except Exception as e:
+        log(f"  Could not install {pip_name}: {e}")
         return False
 
+
+def _b2b_get_ffmpeg_path(log=print):
+    """ffmpeg on PATH first, then the imageio-ffmpeg bundled binary."""
+    ff = shutil.which("ffmpeg")
+    if ff:
+        return ff
+    if _b2b_ensure_pip_package("imageio_ffmpeg", "imageio-ffmpeg", log=log):
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+    return None
+
+
+def _b2b_browser_fetch_mp3(driver, url, log=print):
+    """Fetch a URL through the CURRENT Selenium browsing context's own
+    JavaScript (browser cookies, real User-Agent, browser TLS stack).
+    Returns raw bytes, or None on any failure. Call it while switched INTO
+    the frame whose origin should issue the request - for reCAPTCHA audio
+    that is the bframe (www.google.com, same origin as the audio link)."""
+    import base64 as _b64
+    js = (
+        "const done = arguments[arguments.length - 1];"
+        "fetch(arguments[0], {credentials: 'include'})"
+        ".then(function(r){ if (!r.ok) { throw new Error('HTTP ' + r.status); }"
+        "  return r.arrayBuffer(); })"
+        ".then(function(buf){"
+        "  const b = new Uint8Array(buf); let s = '';"
+        "  for (let i = 0; i < b.length; i += 0x8000)"
+        "    s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));"
+        "  done({ok: true, b64: btoa(s)}); })"
+        ".catch(function(e){ done({ok: false, error: String(e)}); });"
+    )
+    try:
+        driver.set_script_timeout(45)
+        res = driver.execute_async_script(js, url)
+    except Exception as e:
+        log(f"  Browser fetch error: {e}")
+        return None
+    if not res or not res.get("ok"):
+        log("  Browser fetch failed: %s" % (res.get("error") if res else "no result"))
+        return None
+    try:
+        return _b64.b64decode(res["b64"])
+    except Exception as e:
+        log(f"  Browser fetch decode failed: {e}")
+        return None
+
+
+def _b2b_python_fetch_mp3(url, user_agent, referer, cookies, timeout=30):
+    """Direct download that mimics the browser exactly: the real UA, the
+    google.com session cookies captured from the bframe, and the bframe
+    referer. Raises on failure so the caller can retry."""
+    import urllib.request as _ur
+    hdrs = {
+        "User-Agent": user_agent,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": referer or "https://www.google.com/",
+    }
+    if cookies:
+        hdrs["Cookie"] = "; ".join(
+            "%s=%s" % (c.get("name"), c.get("value")) for c in cookies
+        )
+    req = _ur.Request(url, headers=hdrs)
+    with _ur.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _b2b_looks_like_mp3(b):
+    """Cheap sanity check: an MP3 starts with an ID3 tag or an MPEG audio
+    frame sync (0xFF then 3 sync bits). Google occasionally serves an HTML
+    error page instead of audio when a challenge expired - catch that here
+    with a clear diagnostic instead of a confusing ffmpeg failure."""
+    return bool(b) and len(b) >= 3 and (
+        b[:3] == b"ID3" or (b[0] == 0xFF and (b[1] & 0xE0) == 0xE0)
+    )
+
+
+def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
+    """Solve reCAPTCHA v2 via the vidapay-extractor's PROVEN audio flow.
+
+    Steps (identical to the extractor's try_solve_recaptcha, minus the
+    VidaPay-only #btnClick submit — here the login state machine handles
+    what comes after the challenge clears):
+      1. Anchor iframe -> click checkbox
+      2. WAIT for a *visible* bframe (15s) -> click the audio button
+         (15s poll, fallback selectors, JS-click fallback)
+      3. Fetch the MP3 through the BROWSER's own context (same-origin
+         fetch with cookies + real UA) — bare urllib gets reset by Google
+         (WinError 10054); direct-download browser-identity replay is the
+         fallback
+      4. Convert to WAV with ffmpeg, transcribe (Google STT -> vosk ->
+         Whisper fallbacks)
+      5. Enter the answer into #audio-response -> click
+         #recaptcha-verify-button (JS-click + ENTER fallbacks)
+    """
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
+    if not _b2b_ensure_pip_package("speech_recognition", "SpeechRecognition", log=log):
+        log("  SpeechRecognition unavailable — cannot solve reCAPTCHA audio.")
+        return False
+    import speech_recognition as sr
+
+    ffmpeg = _b2b_get_ffmpeg_path(log=log)
+    if not ffmpeg:
+        log("  ffmpeg not found — cannot solve reCAPTCHA audio.")
+        return False
+
     try:
         driver.switch_to.default_content()
 
-        # Find anchor iframe
+        # 1. Anchor iframe -> click checkbox
         anchor = None
         for sel in ["iframe[src*='recaptcha/api2/anchor']",
                     "iframe[src*='recaptcha/enterprise/anchor']",
-                    "iframe[title*='reCAPTCHA']"]:
+                    "iframe[title*='reCAPTCHA']",
+                    "iframe[title*='not a robot']"]:
             try:
                 anchor = driver.find_element(By.CSS_SELECTOR, sel)
                 break
@@ -3055,77 +3177,145 @@ def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
             return False
 
         driver.switch_to.frame(anchor)
+        time.sleep(0.5)
         try:
             cb = driver.find_element(By.ID, "recaptcha-anchor")
             if driver.execute_script("return arguments[0].getAttribute('aria-checked');", cb) != "true":
                 cb.click()
-                log("  reCAPTCHA checkbox clicked.")
+                log("  Checkbox clicked.")
                 time.sleep(2)
         except Exception:
             pass
         driver.switch_to.default_content()
         time.sleep(1.5)
 
-        # Find bframe
-        bframe = None
-        for sel in ["iframe[src*='recaptcha/api2/bframe']",
-                    "iframe[src*='recaptcha/enterprise/bframe']",
-                    "iframe[title*='recaptcha challenge']"]:
-            try:
-                bframe = driver.find_element(By.CSS_SELECTOR, sel)
-                break
-            except Exception:
-                pass
-        if not bframe:
-            log("  reCAPTCHA bframe not found.")
-            return False
-
-        driver.switch_to.frame(bframe)
-        try:
-            WebDriverWait(driver, 8).until(
-                EC.element_to_be_clickable((By.ID, "recaptcha-audio-button"))
-            ).click()
-            log("  Audio button clicked.")
-            time.sleep(2)
-        except Exception as e:
-            log(f"  Audio button error: {e}")
-            driver.switch_to.default_content()
-            return False
-
-        # Audio challenge loop (up to 3 cycles)
-        BFRAME_SELS = ["iframe[src*='recaptcha/api2/bframe']",
-                       "iframe[src*='recaptcha/enterprise/bframe']",
-                       "iframe[title*='recaptcha challenge']"]
+        # 2. bframe -> click audio button.
+        # The challenge iframe can take several seconds to RENDER after the
+        # checkbox click, and stale/hidden bframes from earlier cycles linger
+        # in the DOM — so WAIT for a *visible* bframe instead of grabbing the
+        # first match, then wait generously for the audio button with a
+        # JS-click fallback (a bare 8s wait timed out with
+        # "Could not click audio button: Message: ").
+        _BFRAME_SELS = [
+            "iframe[src*='recaptcha/api2/bframe']",
+            "iframe[src*='recaptcha/enterprise/bframe']",
+            "iframe[title*='recaptcha challenge']",
+            "iframe[title*='challenge expires']",
+        ]
 
         def _find_bframe():
             driver.switch_to.default_content()
-            for sel in BFRAME_SELS:
+            for sel in _BFRAME_SELS:
                 try:
-                    return driver.find_element(By.CSS_SELECTOR, sel)
+                    _f = driver.find_element(By.CSS_SELECTOR, sel)
+                    if _f.is_displayed():
+                        return _f
                 except Exception:
-                    pass
+                    continue
             return None
 
-        submitted = False
-        for cycle in range(3):
-            if cycle > 0:
+        try:
+            WebDriverWait(driver, 15).until(lambda d: _find_bframe() is not None)
+        except Exception:
+            pass
+        bframe = _find_bframe()
+
+        solved_no_challenge = False
+        if not bframe:
+            # No challenge appeared — the checkbox may have solved it alone.
+            _checked = False
+            for _asel in ("iframe[src*='recaptcha/api2/anchor']",
+                          "iframe[src*='recaptcha/enterprise/anchor']",
+                          "iframe[title*='reCAPTCHA']",
+                          "iframe[title*='not a robot']"):
+                try:
+                    _anchor_el = driver.find_element(By.CSS_SELECTOR, _asel)
+                    driver.switch_to.frame(_anchor_el)
+                    _checked = driver.execute_script(
+                        "return arguments[0].getAttribute('aria-checked');",
+                        driver.find_element(By.ID, "recaptcha-anchor")) == "true"
+                    break
+                except Exception:
+                    continue
+            driver.switch_to.default_content()
+            if _checked:
+                log("  Checkbox solved instantly — no audio challenge needed.")
+                solved_no_challenge = True
+            else:
+                log("  reCAPTCHA challenge iframe did not appear.")
+                return False
+
+        transcript = None
+        submitted = solved_no_challenge
+
+        if not solved_no_challenge:
+            driver.switch_to.frame(bframe)
+            time.sleep(1)
+
+            audio_btn = None
+            _AB_SELS = [
+                (By.ID, "recaptcha-audio-button"),
+                (By.CSS_SELECTOR, "button[title*='audio' i]"),
+                (By.CSS_SELECTOR, "button[title*='Audio']"),
+            ]
+            _deadline = time.time() + 15
+            while time.time() < _deadline and audio_btn is None:
+                for _sel in _AB_SELS:
+                    try:
+                        for _el in driver.find_elements(*_sel):
+                            try:
+                                if _el.is_displayed() and _el.is_enabled():
+                                    audio_btn = _el
+                                    break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    if audio_btn is not None:
+                        break
+                if audio_btn is None:
+                    time.sleep(0.5)
+            if audio_btn is None:
+                log("  Could not click audio button: challenge controls never appeared.")
+                driver.switch_to.default_content()
+                return False
+            try:
+                audio_btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", audio_btn)
+            log("  Audio button clicked.")
+            time.sleep(2)
+
+        # 3-5. Audio-challenge loop: up to 3 cycles.
+        # On each failed transcription we click #recaptcha-reload-button
+        # inside the bframe to get a fresh audio clip, then retry.
+        for audio_cycle in range(0 if solved_no_challenge else 3):
+            if audio_cycle > 0:
+                # -- Reload audio challenge ----------------------------------
+                log(f"  Reloading audio challenge (cycle {audio_cycle + 1})...")
                 _bf = _find_bframe()
                 if not _bf:
+                    log("  bframe gone — cannot reload.")
                     break
                 driver.switch_to.frame(_bf)
                 try:
-                    WebDriverWait(driver, 6).until(
+                    _rb = WebDriverWait(driver, 6).until(
                         EC.element_to_be_clickable((By.ID, "recaptcha-reload-button"))
-                    ).click()
-                    log(f"  Audio reloaded (cycle {cycle+1}).")
+                    )
+                    _rb.click()
+                    log("  Audio challenge reloaded.")
                     time.sleep(2.5)
-                except Exception:
+                except Exception as _re:
+                    log(f"  Reload button not clickable: {_re}")
                     driver.switch_to.default_content()
                     break
                 driver.switch_to.default_content()
+                time.sleep(0.5)
 
+            # -- Step 3: get MP3 URL ---------------------------------------
             _bf2 = _find_bframe()
             if not _bf2:
+                log("  bframe missing — cannot get MP3.")
                 break
             driver.switch_to.frame(_bf2)
             time.sleep(1)
@@ -3143,54 +3333,237 @@ def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
                     ).get_attribute("src")
                 except Exception:
                     pass
-            driver.switch_to.default_content()
             if not mp3_url:
+                driver.switch_to.default_content()
+                log(f"  MP3 URL not found (cycle {audio_cycle + 1}).")
                 continue
+            log(f"  MP3 URL obtained (cycle {audio_cycle + 1}).")
 
+            # Capture the google.com session context while still inside the
+            # bframe (needed by the direct-download fallback below).
+            try:
+                _gcookies = driver.get_cookies()
+            except Exception:
+                _gcookies = []
+            try:
+                _greferer = driver.current_url or "https://www.google.com/"
+            except Exception:
+                _greferer = "https://www.google.com/"
+            try:
+                _gua = driver.execute_script("return navigator.userAgent;") or "Mozilla/5.0"
+            except Exception:
+                _gua = "Mozilla/5.0"
+
+            # PRIMARY: download the MP3 through the browser itself. The fetch
+            # runs inside the bframe's own JS context (same origin as the
+            # audio link) with the browser's cookies, real User-Agent and
+            # TLS stack. Google resets bare-urllib connections (WinError
+            # 10054) but not the browser's own requests.
+            mp3_bytes = None
+            if mp3_url:
+                for _b in range(2):
+                    _got = _b2b_browser_fetch_mp3(driver, mp3_url, log=log)
+                    if _got and _b2b_looks_like_mp3(_got):
+                        mp3_bytes = _got
+                        break
+                    if _got:
+                        log(f"  Browser fetch returned non-audio payload "
+                            f"({len(_got)} bytes, head={_got[:16]!r}).")
+                    time.sleep(1)
+            driver.switch_to.default_content()
+
+            # Step 4: Download -> WAV -> STT
             transcript = None
             with tempfile.TemporaryDirectory() as tmp:
                 import os as _os
                 mp3 = _os.path.join(tmp, "c.mp3")
                 wav = _os.path.join(tmp, "c.wav")
+                if mp3_bytes is None:
+                    # FALLBACK: direct download mimicking the browser exactly
+                    # (real UA + google.com cookies + referer), 2 attempts.
+                    for _d in range(2):
+                        try:
+                            _got = _b2b_python_fetch_mp3(
+                                mp3_url, _gua, _greferer, _gcookies, timeout=30
+                            )
+                            if _b2b_looks_like_mp3(_got):
+                                mp3_bytes = _got
+                                break
+                            log(f"  Fallback returned non-audio payload "
+                                f"({len(_got)} bytes, head={_got[:16]!r}).")
+                        except Exception as e:
+                            log(f"  MP3 download failed (attempt {_d + 1}/2): {e}")
+                        time.sleep(2)
+                if mp3_bytes is None:
+                    continue
                 try:
-                    import urllib.request as _ur
-                    _ur.urlretrieve(mp3_url, mp3)
+                    with open(mp3, "wb") as _fh:
+                        _fh.write(mp3_bytes)
+                    log("  MP3 downloaded.")
+                except Exception as e:
+                    log(f"  MP3 save failed: {e}")
+                    continue
+                try:
                     subprocess.run([ffmpeg, "-y", "-i", mp3, "-ar", "16000", "-ac", "1", wav],
                                    capture_output=True, timeout=30)
-                    rec = sr.Recognizer()
-                    with sr.AudioFile(wav) as _src:
-                        _audio = rec.record(_src)
-                    transcript = rec.recognize_google(_audio)
-                    log(f"  STT result: '{transcript}'")
+                    if not _os.path.exists(wav):
+                        log("  ffmpeg conversion failed.")
+                        continue
                 except Exception as e:
-                    log(f"  STT failed (cycle {cycle+1}): {e}")
+                    log(f"  ffmpeg error: {e}")
+                    continue
+
+                # Primary: Google STT (with 2 retries on network errors)
+                for _g in range(2):
+                    try:
+                        rec = sr.Recognizer()
+                        with sr.AudioFile(wav) as _src:
+                            _audio = rec.record(_src)
+                        transcript = rec.recognize_google(_audio)
+                        log(f"  Google STT: '{transcript}'")
+                        break
+                    except Exception as e:
+                        log(f"  Google STT attempt {_g + 1} failed: {e}")
+                        time.sleep(1)
+
+                # Fallback: vosk (lightweight offline model)
+                if not transcript:
+                    log("  Trying vosk offline STT...")
+                    try:
+                        if _b2b_ensure_pip_package("vosk", "vosk", log=log):
+                            import vosk as _vosk
+                            import json as _json
+                            import wave as _wave
+                            _vosk_model_path = _os.path.join(
+                                _os.path.expanduser("~"), ".vosk", "model-en-us-0.22-lgraph"
+                            )
+                            if not _os.path.isdir(_vosk_model_path):
+                                log("  vosk model not found — downloading small model...")
+                                import urllib.request as _ur2
+                                import zipfile as _zf
+                                import io as _io
+                                _model_url = (
+                                    "https://alphacephei.com/vosk/models/"
+                                    "vosk-model-small-en-us-0.15.zip"
+                                )
+                                _vosk_model_path = _os.path.join(
+                                    _os.path.expanduser("~"), ".vosk", "vosk-model-small-en-us-0.15"
+                                )
+                                _os.makedirs(_os.path.dirname(_vosk_model_path), exist_ok=True)
+                                if not _os.path.isdir(_vosk_model_path):
+                                    with _ur2.urlopen(_model_url, timeout=60) as _r:
+                                        _zf.ZipFile(_io.BytesIO(_r.read())).extractall(
+                                            _os.path.dirname(_vosk_model_path)
+                                        )
+                                    log("  vosk model downloaded.")
+                            if _os.path.isdir(_vosk_model_path):
+                                _vm = _vosk.Model(_vosk_model_path)
+                                _wf = _wave.open(wav, "rb")
+                                _vr = _vosk.KaldiRecognizer(_vm, _wf.getframerate())
+                                _parts = []
+                                while True:
+                                    _chunk = _wf.readframes(4000)
+                                    if not _chunk:
+                                        break
+                                    if _vr.AcceptWaveform(_chunk):
+                                        _parts.append(_json.loads(_vr.Result()).get("text", ""))
+                                _parts.append(_json.loads(_vr.FinalResult()).get("text", ""))
+                                transcript = " ".join(p for p in _parts if p).strip()
+                                log(f"  vosk: '{transcript}'")
+                    except Exception as e3:
+                        log(f"  vosk failed: {e3}")
+
+                # Fallback: Whisper (large; only when pip can supply it)
+                if not transcript:
+                    log("  Trying Whisper...")
+                    try:
+                        if _b2b_ensure_pip_package("whisper", "openai-whisper", log=log):
+                            import whisper as _w
+                            _model = _w.load_model("base")
+                            transcript = _model.transcribe(wav).get("text", "").strip()
+                            log(f"  Whisper: '{transcript}'")
+                    except Exception as e2:
+                        log(f"  Whisper failed: {e2}")
 
             if not transcript:
-                continue
+                log(f"  All STT methods failed on cycle {audio_cycle + 1}.")
+                continue  # reload and try a new audio clip
 
+            # -- Step 5: submit answer ---------------------------------------
             _bf3 = _find_bframe()
             if not _bf3:
+                log("  bframe gone before answer entry.")
                 break
             driver.switch_to.frame(_bf3)
+            time.sleep(0.5)
+            inp = None
             try:
-                inp = WebDriverWait(driver, 8).until(
-                    EC.presence_of_element_located((By.ID, "audio-response"))
+                inp = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.ID, "audio-response"))
                 )
                 inp.clear()
                 inp.send_keys(transcript.lower().strip())
                 time.sleep(0.4)
-                driver.find_element(By.ID, "recaptcha-verify-button").click()
-                log(f"  reCAPTCHA answer submitted (cycle {cycle+1}).")
+                # Wait for the VERIFY button, click it, and fall back to a
+                # JS click — the bare find_element().click() here raced the
+                # challenge reload and silently failed, leaving the solver
+                # stuck on the audio step (Verify never clicked).
+                _vbtn = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.ID, "recaptcha-verify-button"))
+                )
+                try:
+                    _vbtn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", _vbtn)
+                log(f"  reCAPTCHA answer submitted (cycle {audio_cycle + 1}).")
                 time.sleep(2.5)
-                submitted = True
+
+                # Check for "Multiple correct solutions required" error.
+                # This means our answer was right but reCAPTCHA wants more.
+                # Click reload and try a fresh audio clip on the next cycle.
+                _multi_err = False
+                try:
+                    _err_el = driver.find_element(
+                        By.CSS_SELECTOR, ".rc-audiochallenge-error-message"
+                    )
+                    _err_text = (_err_el.get_attribute("textContent") or "").strip().lower()
+                    if "multiple correct solutions" in _err_text or _err_el.is_displayed():
+                        log("  'Multiple correct solutions required' — reloading challenge...")
+                        _multi_err = True
+                        try:
+                            _rb = driver.find_element(By.ID, "recaptcha-reload-button")
+                            _rb.click()
+                            log("  Audio challenge reloaded after multi-solution error.")
+                            time.sleep(2.5)
+                        except Exception as _rbe:
+                            log(f"  Reload button not found after multi-solution error: {_rbe}")
+                except Exception:
+                    pass
+
+                if not _multi_err:
+                    submitted = True
             except Exception as e:
-                log(f"  Answer submit error: {e}")
+                log(f"  Could not submit answer: {e}")
+                # Last-chance fallback: ENTER inside the answer box also
+                # submits the reCAPTCHA form.
+                try:
+                    if inp is not None:
+                        from selenium.webdriver.common.keys import Keys as _K2
+                        inp.send_keys(_K2.ENTER)
+                        log("  Answer re-submitted via ENTER.")
+                        time.sleep(2.5)
+                        submitted = True
+                except Exception:
+                    pass
             driver.switch_to.default_content()
             if submitted:
-                break
+                break  # exit audio_cycle loop
 
         driver.switch_to.default_content()
-        return submitted
+        time.sleep(1.5)
+        if not submitted:
+            log("  reCAPTCHA audio solve exhausted all cycles.")
+        return bool(submitted)
 
     except Exception as e:
         log(f"  reCAPTCHA solver error: {e}")
@@ -5415,6 +5788,16 @@ class B2BSoftScraper:
                 time.sleep(1)
             if not _login_advanced:
                 self.log("URL unchanged and portal not detected yet — continuing to the login state machine.")
+            # reCAPTCHA / Cloudflare can appear right after the Sign In click —
+            # the extractor's login_store runs
+            # wait_for_human_verification_clear("after sign in") HERE, before
+            # its invalid-credential check. Do the same so a post-submit
+            # challenge is solved (fixed audio solver) instead of derailing
+            # the sign-in workflow after the Access Code step.
+            if _b2b_is_human_verification_page(drv):
+                self.log("[B2B] Verification challenge after sign in — clearing…")
+                if not _b2b_wait_for_human_verification_clear(drv, stop_event=stop_event, log=self.log):
+                    self.log("[B2B] Verification did not clear after sign in — state machine will retry.")
             # Invalid-credentials detection + re-entry (extractor login_store).
             for _cred_retry in range(2):
                 time.sleep(1.5)

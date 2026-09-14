@@ -14,3 +14,7 @@ webdriver-manager>=4.0.0
 pdfplumber>=0.9.0
 pypdf>=3.0.0
 requests>=2.31.0
+
+# reCAPTCHA audio solver (B2B portal) — speech-to-text + ffmpeg binary
+SpeechRecognition>=3.10
+imageio-ffmpeg>=0.4.9

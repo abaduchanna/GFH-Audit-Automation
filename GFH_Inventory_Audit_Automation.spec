@@ -56,6 +56,8 @@ a = Analysis(
         'PIL',
         'openpyxl',
         'pyautogui',
+        'speech_recognition',
+        'imageio_ffmpeg',
     ],
     hookspath=[],
     hooksconfig={
