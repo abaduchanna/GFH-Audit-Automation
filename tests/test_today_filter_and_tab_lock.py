@@ -158,7 +158,7 @@ def test_browser_lock_exists_and_serializes_tab_ops():
 def test_open_monitoring_tabs_holds_lock_per_batch():
     src = _get_source("open_monitoring_tabs")
     assert "with _BROWSER_LOCK:" in src
-    assert "_find_or_open_tab(driver, url, log=log)" in src
+    assert "_find_or_open_tab(driver, url, log=log, extra_origins=extra)" in src
     assert "_ensure_edge_open(port, log=log)" in src  # retry ladder intact
 
 

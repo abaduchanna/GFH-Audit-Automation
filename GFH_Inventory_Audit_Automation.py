@@ -3126,12 +3126,64 @@ def _b2b_looks_like_mp3(b):
     )
 
 
+def _b2b_click_login_verify(driver, log=print) -> bool:
+    """Click the SSO login form's orange Verify button (#btnClick) after the
+    reCAPTCHA checkbox has been solved — port of vidapay-extractor step 6.
+
+    Solving the checkbox alone does NOT submit the login form; the site's own
+    Verify button must be clicked before the SSO forwards to the portal. The
+    login state machine does NOT perform this click by itself (2026-09-15:
+    the automation sat on the solved-captcha page and piled up Login tabs on
+    every retry until this step was ported)."""
+    from selenium.webdriver.common.by import By
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+    time.sleep(1)
+    for attempt in range(5):
+        try:
+            btns = driver.find_elements(By.ID, "btnClick")
+            # Then orange verify buttons / data-test-id fallbacks
+            btns += driver.find_elements(
+                By.CSS_SELECTOR,
+                "button[data-test-id='verify'], button[value='login'], "
+                "button[data-callback='formSubmit']")
+            btns += driver.find_elements(
+                By.XPATH,
+                "//button[contains(@class,'btn-orange') and "
+                "contains(translate(normalize-space(),'VERIFY','verify'),'verify')]")
+            target = None
+            for b in btns:
+                try:
+                    if b.is_displayed() and b.is_enabled():
+                        target = b
+                        break
+                except Exception:
+                    continue
+            if target is not None:
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+                time.sleep(0.4)
+                try:
+                    target.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", target)
+                log("[B2B] Clicked the login Verify button (orange #btnClick) after reCAPTCHA solve.")
+                time.sleep(2.5)
+                return True
+        except Exception:
+            pass
+        time.sleep(1.5)  # button may render a moment after reCAPTCHA clears
+    log("[B2B] Login Verify button (#btnClick) not found after solving reCAPTCHA.")
+    return False
+
+
 def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
     """Solve reCAPTCHA v2 via the vidapay-extractor's PROVEN audio flow.
 
-    Steps (identical to the extractor's try_solve_recaptcha, minus the
-    VidaPay-only #btnClick submit — here the login state machine handles
-    what comes after the challenge clears):
+    Steps (identical to the extractor's try_solve_recaptcha, INCLUDING
+    step 6 — the SSO login form's orange Verify button #btnClick is clicked
+    after the challenge clears; the solved checkbox alone does not submit):
       1. Anchor iframe -> click checkbox
       2. WAIT for a *visible* bframe (15s) -> click the audio button
          (15s poll, fallback selectors, JS-click fallback)
@@ -3563,7 +3615,12 @@ def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
         time.sleep(1.5)
         if not submitted:
             log("  reCAPTCHA audio solve exhausted all cycles.")
-        return bool(submitted)
+            return False
+        # vidapay-extractor step 6: a solved checkbox does NOT submit the
+        # login form — click the site's orange Verify button, otherwise the
+        # SSO never forwards to the portal.
+        _b2b_click_login_verify(driver, log=log)
+        return True
 
     except Exception as e:
         log(f"  reCAPTCHA solver error: {e}")
@@ -4374,6 +4431,11 @@ def _b2b_wait_for_new_sign_in_clear(driver, stop_event=None, timeout: int = 300,
 EDGE_DEBUG_PORT = 9227
 _WA_URL = "https://web.whatsapp.com"
 _B2B_URL = "https://wsreports.b2bsoft.com/#"
+# The B2B SSO bounces wsreports.b2bsoft.com ⇄ id.vidapay.com — both origins
+# are ONE tab family (see _find_or_open_tab): the redirect moves the tab off
+# its original origin, and a plain origin check then opens a fresh Login tab
+# on every retry (that is how 4-6 duplicate Login tabs piled up).
+_B2B_TAB_FAMILY = ("https://wsreports.b2bsoft.com", "https://id.vidapay.com")
 _GFH_APP_URL = "https://gfh-telecom-app.web.app/timesheet"
 _wa_fallback_opened: bool = False  # prevent webbrowser.open firing multiple times when Edge not running
 
@@ -4750,13 +4812,19 @@ def _harden_attached_driver(driver, log=None) -> bool:
 _BROWSER_LOCK = threading.RLock()
 
 
-def _find_or_open_tab(driver, url: str, log=None) -> None:
-    """Switch to an existing tab on url's origin; open one when absent.
+def _find_or_open_tab(driver, url: str, log=None, extra_origins: tuple = ()) -> None:
+    """Switch to an existing tab of this URL's tab family; open one when absent.
+
+    A tab family is the URL's own origin plus any `extra_origins` — the B2B
+    family covers wsreports.b2bsoft.com AND id.vidapay.com, because the SSO
+    redirect moves the tab off its original origin (a plain origin check then
+    opened a fresh Login tab on every retry). Duplicate family tabs left by
+    earlier retries are CLOSED and one reused, so each run heals the pile-up.
 
     Recovery ladder ported from vidapay-extractor (open_url_in_edge_tab /
     open_blank_normal_tab) — each tier fixes a different real-world failure:
-      1. Same-origin tab exists        → switch to it (normal path)
-      2. Blank/new-tab surface exists  → navigate it to the URL
+      1. Family tab exists            → reuse it, close duplicate family tabs
+      2. Blank/new-tab surface exists → navigate it to the URL
       3. switch_to.new_window('tab')   → recovers 'target closed' sessions
       4. CDP Target.createTarget       → recovers when window.open is blocked
       5. OS-level real Edge tab        → recovers when the browser rejected
@@ -4771,19 +4839,50 @@ def _find_or_open_tab(driver, url: str, log=None) -> None:
     with _BROWSER_LOCK:
         parsed = urlparse(url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
+        origins = [origin] + [o.rstrip("/") for o in extra_origins if o]
         handles = _get_driver_handles(driver)
         blank_handle = None
+        matches = []
         for handle in handles:
             try:
                 driver.switch_to.window(handle)
                 cur = driver.current_url
             except Exception:
                 continue
-            if cur and cur.startswith(origin):
-                return
+            if cur and any(cur.startswith(o) for o in origins):
+                matches.append(handle)
+                continue
             if blank_handle is None and not _is_browser_chrome_url(cur) and (
                     any(cur == b or cur.startswith(b) for b in _BLANK_TAB_URLS)):
                 blank_handle = handle
+        if matches:
+            # Reuse ONE family tab and close the extras. Prefer a family tab
+            # that is NOT parked on the login page (likely the authenticated
+            # session); otherwise keep the newest one.
+            keep = None
+            for h in matches:
+                try:
+                    driver.switch_to.window(h)
+                    if "account/login" not in (driver.current_url or "").lower():
+                        keep = h
+                        break
+                except Exception:
+                    continue
+            if keep is None:
+                keep = matches[-1]
+            for dup in matches:
+                if dup == keep:
+                    continue
+                try:
+                    driver.switch_to.window(dup)
+                    driver.close()
+                except Exception:
+                    pass
+            try:
+                driver.switch_to.window(keep)
+            except Exception:
+                pass
+            return
         if blank_handle is not None:
             try:
                 driver.switch_to.window(blank_handle)
@@ -4826,7 +4925,7 @@ def _find_or_open_tab(driver, url: str, log=None) -> None:
                 cur = driver.current_url or ""
             except Exception:
                 continue
-            if cur.startswith(origin):
+            if any(cur.startswith(o) for o in origins):
                 if log:
                     log("Opened the page in a real Edge tab (OS-level recovery).")
                 return
@@ -4861,9 +4960,9 @@ def open_monitoring_tabs(port: int = EDGE_DEBUG_PORT, include_whatsapp: bool = T
     Failures are LOGGED (previously swallowed by a bare except — the scheduler
     never showed why tabs were missing) and retried once after re-launching
     the automation Edge with the extractor's recovery ladder."""
-    targets = [(_B2B_URL, "B2B"), (_GFH_APP_URL, "GFH app")]
+    targets = [(_B2B_URL, "B2B", _B2B_TAB_FAMILY), (_GFH_APP_URL, "GFH app", ())]
     if include_whatsapp:
-        targets.append((_WA_URL, "WhatsApp Web"))
+        targets.append((_WA_URL, "WhatsApp Web", ()))
 
     opened: list = []
     for attempt in (1, 2):
@@ -4875,9 +4974,9 @@ def open_monitoring_tabs(port: int = EDGE_DEBUG_PORT, include_whatsapp: bool = T
                 driver = _edge_debug_driver(port)
                 _harden_attached_driver(driver, log=log)
                 opened = []
-                for url, name in targets:
+                for url, name, extra in targets:
                     try:
-                        _find_or_open_tab(driver, url, log=log)
+                        _find_or_open_tab(driver, url, log=log, extra_origins=extra)
                         opened.append(name)
                     except Exception as exc:
                         if log:
@@ -4944,7 +5043,8 @@ class B2BSoftScraper:
                 "behavior": "allow",
                 "downloadPath": str(self.download_dir),
             })
-            _find_or_open_tab(self.driver, _B2B_URL, log=self.log)
+            _find_or_open_tab(self.driver, _B2B_URL, log=self.log,
+                              extra_origins=_B2B_TAB_FAMILY)
             self._using_debug_port = True
             return
         except Exception:
@@ -4993,7 +5093,8 @@ class B2BSoftScraper:
             self._make_driver()
         self.download_dir.mkdir(parents=True, exist_ok=True)
         # Switch to B2B tab before navigating — prevents overwriting another scraper's tab.
-        _find_or_open_tab(self.driver, self.PORTAL_URL, log=self.log)
+        _find_or_open_tab(self.driver, self.PORTAL_URL, log=self.log,
+                          extra_origins=_B2B_TAB_FAMILY)
         self.log(f"Opening {self.PORTAL_URL}")
         try:
             self.driver.get(self.PORTAL_URL)
