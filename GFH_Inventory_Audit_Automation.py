@@ -4,7 +4,7 @@ import sys
 from datetime import date
 from logo_handler import LogoHandler
 
-# Developed by Abad Umair Channa | Copyright © {date.today().year} | All rights reserved.
+# Developed by www.3SVerse.com | Copyright © {date.today().year} | All rights reserved.
 """
 GFH Telecom LLC Inventory Audit v27
 
@@ -6933,7 +6933,7 @@ class GFHApp(tk.Tk):
         _cbar._tag = "footer"
         _clbl = tk.Label(
             _cbar,
-            text=f"Developed by Abad Umair Channa | Copyright \u00a9 {date.today().year} | All rights reserved.",
+            text=f"Developed by www.3SVerse.com | Copyright \u00a9 {date.today().year} | All rights reserved.",
             font=("Segoe UI", 8), fg="#c7cbe0", bg="#090d26",
         )
         _clbl.pack(expand=True, fill="both")
@@ -8191,6 +8191,7 @@ class GFHApp(tk.Tk):
         ttk.Entry(form, textvariable=self.store_name_var, width=32).grid(row=0, column=3, sticky="w", padx=(0, 12), pady=3)
         ttk.Button(form, text="Save Store", command=self.save_store_account_from_form).grid(row=0, column=4, padx=(0, 6), pady=3)
         ttk.Button(form, text="Import XLSX", command=self.import_store_accounts_file).grid(row=0, column=5, padx=(0, 6), pady=3)
+        ttk.Button(form, text="Download Template", command=self.download_store_accounts_template).grid(row=0, column=7, padx=(0, 6), pady=3)
         ttk.Button(form, text="Delete Selected", command=self.delete_selected_store_account).grid(row=0, column=6, padx=(0, 6), pady=3)
         ttk.Button(form, text="Clear Form", command=self.clear_store_form).grid(row=0, column=7, padx=(0, 6), pady=3)
 
@@ -8252,6 +8253,7 @@ class GFHApp(tk.Tk):
         ttk.Button(btn_frame, text="Save Employee", command=self.save_sales_rep_from_form).pack(side="left", padx=(0, 6))
         ttk.Button(btn_frame, text="Auto-detect Created By", command=self._rep_auto_detect_created_by).pack(side="left", padx=(0, 6))
         ttk.Button(btn_frame, text="Import XLSX", command=self.import_employees_file).pack(side="left", padx=(0, 6))
+        ttk.Button(btn_frame, text="Download Template", command=self.download_employees_template).pack(side="left", padx=(0, 6))
         ttk.Button(btn_frame, text="Export Excel", command=self.export_employees_file).pack(side="left", padx=(0, 6))
         ttk.Button(btn_frame, text="Delete Selected", command=self.delete_selected_sales_rep).pack(side="left", padx=(0, 6))
         ttk.Button(btn_frame, text="Clear Form", command=self.clear_rep_form).pack(side="left")
@@ -8371,6 +8373,99 @@ class GFHApp(tk.Tk):
             "Matches found:\n" + "\n".join(summary_lines[:20]) +
             ("\n..." if len(summary_lines) > 20 else "") +
             "\n\nFill in Phone numbers in the Employees tab, then Save."
+        )
+
+
+    # ── Download import templates (extractor pattern) ─────────────────────
+    def _save_import_template_xlsx(self, sheet_title, initial_file, headers,
+                                   example_rows, column_hint, done_note):
+        """Builds and saves one import template workbook with the import
+        columns already defined in the header row (LANCZOS-free, openpyxl)."""
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            messagebox.showerror(
+                "Missing Dependency",
+                "openpyxl is required to build the template.\n\nInstall it with:\n  pip install openpyxl",
+            )
+            return
+        save_path = filedialog.asksaveasfilename(
+            title="Save import template",
+            defaultextension=".xlsx",
+            initialfile=initial_file,
+            filetypes=[("Excel file", "*.xlsx")],
+        )
+        if not save_path:
+            return
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = sheet_title
+            header_fill = PatternFill("solid", fgColor="090D26")
+            for c, name in enumerate(headers, start=1):
+                cell = ws.cell(row=1, column=c, value=name)
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = header_fill
+                ws.column_dimensions[get_column_letter(c)].width = 28
+            for row in example_rows:
+                ws.append(row)
+            wb.save(save_path)
+        except Exception as exc:
+            messagebox.showerror("Template Failed", f"Could not create the template:\n\n{exc}")
+            return
+        messagebox.showinfo(
+            "Template Ready",
+            f"Template saved:\n{save_path}\n\n"
+            f"Columns: {column_hint}\n\n"
+            f"{done_note}",
+        )
+        try:
+            self.log(f"Import template saved: {save_path}")
+        except Exception:
+            pass
+
+    def download_store_accounts_template(self):
+        """Store list import template — District + Store columns."""
+        self._save_import_template_xlsx(
+            sheet_title="Stores",
+            initial_file="Store_List_Template.xlsx",
+            headers=["District", "Store"],
+            example_rows=[
+                ["Arizona", "Store 1"],
+                ["Houston", "Store 2"],
+            ],
+            column_hint="District | Store",
+            done_note="Replace the two example rows with the real district store list, then use Import XLSX.",
+        )
+
+    def download_employees_template(self):
+        """Employees import template — Employee Name + Phone Number."""
+        self._save_import_template_xlsx(
+            sheet_title="Employees",
+            initial_file="Employees_Template.xlsx",
+            headers=["Employee Name", "Phone Number"],
+            example_rows=[
+                ["John Doe", "346-555-0101"],
+                ["Jane Smith", "346-555-0102"],
+            ],
+            column_hint="Employee Name | Phone Number",
+            done_note="Replace the two example rows with the real employees, then use Import XLSX.",
+        )
+
+    def download_excluded_imeis_template(self):
+        """Excluded-IMEIs import template — District | Product | IMEI | Comments."""
+        self._save_import_template_xlsx(
+            sheet_title="Excluded IMEIs",
+            initial_file="Excluded_IMEIs_Template.xlsx",
+            headers=["District", "Product", "IMEI", "Comments"],
+            example_rows=[
+                ["Arizona", "Device Model A", "350000000000123", "Demo unit"],
+                ["Houston", "Device Model B", "350000000000124", "Damaged"],
+            ],
+            column_hint="District | Product | IMEI | Comments",
+            done_note="IMEI is required; the other columns are optional. Then use Import XLSX.",
         )
 
     def import_store_accounts_file(self) -> None:
@@ -9098,6 +9193,7 @@ class GFHApp(tk.Tk):
         ttk.Button(form, text="Save", command=self.save_device_exclusion_from_form).grid(row=0, column=9, padx=(0, 4), pady=3)
         ttk.Button(form, text="Update Comment", command=self.update_selected_exclusion_comment).grid(row=0, column=10, padx=(0, 4), pady=3)
         ttk.Button(form, text="Import XLSX", command=self.import_excluded_imeis_file).grid(row=0, column=11, padx=(0, 4), pady=3)
+        ttk.Button(form, text="Download Template", command=self.download_excluded_imeis_template).grid(row=0, column=13, padx=(0, 4), pady=3)
         ttk.Button(form, text="Export Excel", command=self.export_excluded_imeis_file).grid(row=0, column=12, padx=(0, 4), pady=3)
         ttk.Button(form, text="Delete", command=self.delete_selected_device_exclusion).grid(row=0, column=13, padx=(0, 4), pady=3)
         ttk.Button(form, text="Delete All", command=self.delete_all_device_exclusions_from_ui).grid(row=0, column=14, padx=(0, 4), pady=3)
