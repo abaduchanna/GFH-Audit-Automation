@@ -4,7 +4,7 @@ import sys
 from datetime import date
 from logo_handler import LogoHandler
 
-# Developed by Abad Umair Channa | Copyright © {date.today().year} | All rights reserved.
+# Developed by www.3SVerse.com | Copyright © {date.today().year} | All rights reserved.
 """
 GFH Telecom LLC Inventory Audit v27
 
@@ -6058,7 +6058,7 @@ class GFHApp(tk.Tk):
         _cbar._tag = "footer"
         _clbl = tk.Label(
             _cbar,
-            text=f"Developed by Abad Umair Channa | Copyright \u00a9 {date.today().year} | All rights reserved.",
+            text=f"Developed by www.3SVerse.com | Copyright \u00a9 {date.today().year} | All rights reserved.",
             font=("Segoe UI", 8), fg="#c7cbe0", bg="#090d26",
         )
         _clbl.pack(expand=True, fill="both")
