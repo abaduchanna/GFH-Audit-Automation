@@ -2824,54 +2824,104 @@ def _b2b_is_human_verification_page(driver) -> bool:
         return False
 
 
-def _b2b_pyautogui_click_turnstile(driver, log=print) -> bool:
-    """Click the Cloudflare Turnstile checkbox using pyautogui OS-level click.
-    The widget iframe sits inside a CLOSED shadow root, unreachable by JS/CSS
-    selectors, so we locate its host element by stable 300×65 geometry and
-    click ~22 px from the left edge (where the checkbox lives)."""
-    try:
-        import pyautogui as _pg
-    except ImportError:
-        log("  pyautogui not available — cannot click Turnstile.")
-        return False
+def _b2b_cdp_click_turnstile(driver, log=print) -> bool:
+    """
+    Solve the Cloudflare Turnstile widget using a CDP trusted click.
 
-    def _offsets():
-        return driver.execute_script("""
-            return {
-                sx: window.screenX !== undefined ? window.screenX : (window.screenLeft || 0),
-                sy: window.screenY !== undefined ? window.screenY : (window.screenTop  || 0),
-                ch: (window.outerHeight - window.innerHeight) || 0
-            };
-        """)
+    Why this replaced the old pyautogui approach:
+      - pyautogui moves the REAL OS mouse and needs Edge in the FOREGROUND
+        (SetForegroundWindow), so it hijacks the user's screen. That breaks
+        the "run automation on one screen, work on another" workflow.
+      - CDP Input.dispatchMouseEvent synthesizes trusted (isTrusted=true)
+        browser-level input at VIEWPORT coordinates. From the page's point
+        of view it is indistinguishable from a real click, but it never
+        touches the OS mouse, never steals focus, and works regardless of
+        which monitor Edge sits on or what DPI scaling is in play.
 
-    def _do_click(cx, cy, label=""):
-        log(f"  pyautogui click at ({cx}, {cy}){' — ' + label if label else ''}…")
+    Widget location (unchanged, proven trick): Cloudflare renders the
+    Turnstile iframe inside a CLOSED shadow root, so querySelector can never
+    see the iframe itself. But Cloudflare ALWAYS injects a hidden
+    [name="cf-turnstile-response"] input into the MAIN DOM; the parent chain
+    of that input hosts the ~300x65 widget box, and getBoundingClientRect()
+    on it yields the exact viewport coordinates for the CDP click.
+
+    Success signal: the response token filling in the MAIN DOM:
+        document.querySelector('[name="cf-turnstile-response"]').value
+    Non-empty token = Turnstile accepted the solve. Checked BEFORE clicking
+    (managed / non-interactive challenges pass with no click at all) and
+    polled after every click attempt.
+    """
+
+    def _token():
         try:
-            _pg.moveTo(cx, cy, duration=0.3)
-            time.sleep(0.15)
-            _pg.click()
-            time.sleep(0.35)
-            _pg.click()
-            return True
-        except Exception as e:
-            log(f"  pyautogui error: {e}")
-            return False
+            return driver.execute_script("""
+                const el = document.querySelector('[name="cf-turnstile-response"]');
+                return el && el.value ? el.value : '';
+            """) or ""
+        except Exception:
+            return ""
 
     def _cleared():
         try:
-            time.sleep(2)
-            return not bool(driver.execute_script("""
+            still = driver.execute_script("""
                 const t = (document.body.innerText || '').toLowerCase();
-                return (t.includes('verify you are human') ||
-                        t.includes('performing security verification') ||
-                        t.includes('just a moment'));
-            """))
+                if (t.includes('verify you are human') || t.includes('verify human')) return true;
+                if (t.includes('performing security verification')) return true;
+                if (t.includes('just a moment')) return true;
+                return false;
+            """)
+            return not still
         except Exception:
             return False
 
-    time.sleep(2.5)
+    def _cdp_click(x, y):
+        """Trusted click at viewport (x, y) via CDP input events."""
+        try:
+            # Approach movement — pointer trajectory is one of the signals
+            steps = [(x - 60, y - 45), (x - 25, y - 15), (x, y)]
+            for sx, sy in steps:
+                driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                    "type": "mouseMoved", "x": int(sx), "y": int(sy),
+                    "button": "none", "buttons": 0,
+                })
+                time.sleep(0.06)
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mousePressed", "x": int(x), "y": int(y),
+                "button": "left", "buttons": 1, "clickCount": 1,
+            })
+            time.sleep(0.08)
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "x": int(x), "y": int(y),
+                "button": "left", "buttons": 0, "clickCount": 1,
+            })
+            return True
+        except Exception as e:
+            log(f"  CDP click error: {e}")
+            return False
+
+    def _actions_click(el, x_off, w):
+        """Fallback trusted click via Selenium ActionChains (also CDP-level,
+        also completely screen-free)."""
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+            ActionChains(driver).move_to_element_with_offset(
+                el, int(x_off - w / 2), 0).click().perform()
+            return True
+        except Exception as e:
+            log(f"  ActionChains click error: {e}")
+            return False
+
+    # -- 0. Already solved? (managed / non-interactive auto-pass) -------------
+    tok = _token()
+    if tok:
+        log("  Turnstile token already present - no click needed.")
+        return True
+
+    time.sleep(2.0)  # let the widget finish rendering
+
+    # -- 1. Locate the widget box by geometry (closed-shadow safe) ------------
     rect = None
-    for _tick in range(15):
+    for tick in range(10):
         try:
             rect = driver.execute_script("""
                 const cfInput = document.querySelector(
@@ -2882,8 +2932,11 @@ def _b2b_pyautogui_click_turnstile(driver, log=print) -> bool:
                         const r = el.getBoundingClientRect();
                         if (r.width >= 250 && r.width <= 380 &&
                             r.height >= 45 && r.height <= 110 &&
-                            (r.top > 0 || r.left > 0))
-                            return {left:r.left, top:r.top, width:r.width, height:r.height};
+                            (r.top > 0 || r.left > 0)) {
+                            return {left:r.left, top:r.top,
+                                    width:r.width, height:r.height,
+                                    source:'cf-input-parent'};
+                        }
                         el = el.parentElement;
                     }
                 }
@@ -2891,46 +2944,130 @@ def _b2b_pyautogui_click_turnstile(driver, log=print) -> bool:
                 for (const el of all) {
                     const r = el.getBoundingClientRect();
                     if (r.width >= 280 && r.width <= 320 && r.height >= 55 && r.height <= 75) {
-                        const txt = (el.innerText || '').toLowerCase();
-                        if (txt.includes('verify you are human') || txt.includes('verify'))
+                        const txt = (el.innerText || '').trim().toLowerCase();
+                        if (txt.includes('verify you are human') || txt.includes('verify')) {
                             return {left:r.left, top:r.top, width:r.width, height:r.height};
+                        }
                     }
                 }
                 return null;
             """)
             if rect:
-                log(f"  Turnstile widget found at tick {_tick+1}.")
+                log(f"  Turnstile widget located (tick {tick+1}/10): "
+                    f"{int(rect['width'])}x{int(rect['height'])}px "
+                    f"at viewport ({int(rect['left'])},{int(rect['top'])}).")
                 break
+            # Bail out early when this is clearly NOT a Turnstile page, so the
+            # reCAPTCHA branch is not starved.
+            if tick >= 4:
+                has_cf = driver.execute_script("""
+                    return !!(document.querySelector('[name="cf-turnstile-response"]') ||
+                              document.querySelector('input[id*="cf-chl-widget"]') ||
+                              document.querySelector('.cf-turnstile'));
+                """)
+                if not has_cf:
+                    log("  No Turnstile widget/response input found - not a Turnstile page.")
+                    return False
         except Exception:
             pass
         time.sleep(1)
 
     if not rect:
-        log("  Turnstile widget not found — blind-click fallback.")
-        try:
-            pw = driver.execute_script("return window.innerWidth;")
-            ph = driver.execute_script("return window.innerHeight;")
-            o = _offsets()
-            for fx, fy in [(0.5, 0.45), (0.5, 0.50), (0.5, 0.55)]:
-                cx = int(o['sx'] + pw * fx - 128)
-                cy = int(o['sy'] + o['ch'] + ph * fy)
-                if _do_click(cx, cy) and _cleared():
-                    return True
-        except Exception:
-            pass
+        log("  Could not locate the Turnstile widget box by geometry scan.")
         return False
 
-    o = _offsets()
-    cy = int(o['sy'] + o['ch'] + rect['top'] + rect['height'] / 2)
-    for x_off in [22, 16, 30, 12, 40]:
-        cx = int(o['sx'] + rect['left'] + x_off)
-        if _do_click(cx, cy, f"x_off={x_off}") and _cleared():
+    # -- 2. Scroll the widget into view and re-read its rect ------------------
+    try:
+        driver.execute_script("""
+            const cfInput = document.querySelector('[name="cf-turnstile-response"]');
+            let el = null;
+            if (cfInput) {
+                el = cfInput.parentElement;
+                for (let i = 0; i < 6 && el; i++) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 250 && r.width <= 380 && r.height >= 45 && r.height <= 110) break;
+                    el = el.parentElement;
+                }
+            }
+            if (!el) {
+                const all = document.querySelectorAll('div');
+                for (const c of all) {
+                    const r = c.getBoundingClientRect();
+                    const txt = (c.innerText || '').trim().toLowerCase();
+                    if (r.width >= 280 && r.width <= 320 && r.height >= 55 && r.height <= 75 &&
+                        txt.includes('verify')) { el = c; break; }
+                }
+            }
+            if (el) el.scrollIntoView({block:'center', inline:'center'});
+        """)
+        time.sleep(0.8)
+        rect2 = driver.execute_script("""
+            const cfInput = document.querySelector('[name="cf-turnstile-response"]');
+            if (cfInput) {
+                let el = cfInput.parentElement;
+                for (let i = 0; i < 6 && el; i++) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 250 && r.width <= 380 && r.height >= 45 && r.height <= 110 &&
+                        r.top > 0 && r.left > 0) {
+                        return {left:r.left, top:r.top, width:r.width, height:r.height};
+                    }
+                    el = el.parentElement;
+                }
+            }
+            return null;
+        """)
+        if rect2:
+            rect = rect2
+    except Exception:
+        pass
+
+    time.sleep(1.0)  # let Cloudflare's JS listeners fully bind
+
+    # -- 3. Click attempts across the checkbox zone ---------------------------
+    w = rect["width"]
+    attempts = [(x_off, "checkbox") for x_off in (22, 16, 30, 12, 40)]
+    attempts.append((w / 2, "centre"))
+
+    for x_off, label in attempts:
+        if _token():
+            log("  Turnstile token present - solved.")
             return True
-        time.sleep(0.6)
+        cx = rect["left"] + x_off
+        cy = rect["top"] + rect["height"] / 2
+        log(f"  CDP trusted click at viewport ({int(cx)},{int(cy)}) [{label}]...")
+        clicked = _cdp_click(cx, cy)
+        if not clicked:
+            # Fallback: ActionChains on the wrapper element (still screen-free)
+            try:
+                el = driver.execute_script("""
+                    const cfInput = document.querySelector('[name="cf-turnstile-response"]');
+                    if (cfInput) {
+                        let p = cfInput.parentElement;
+                        for (let i = 0; i < 6 && p; i++) {
+                            const r = p.getBoundingClientRect();
+                            if (r.width >= 250 && r.width <= 380 && r.height >= 45 && r.height <= 110)
+                                return p;
+                            p = p.parentElement;
+                        }
+                    }
+                    return null;
+                """)
+                if el:
+                    clicked = _actions_click(el, x_off, rect["width"])
+            except Exception:
+                pass
+        # Poll for the token - the definitive success signal (up to 8s)
+        for _w in range(16):
+            time.sleep(0.5)
+            if _token():
+                log("  Turnstile token captured - verified CLEAR.")
+                return True
+            if _w == 5 and _cleared():
+                log("  Challenge text gone - treated as cleared.")
+                return True
 
-    log("  Turnstile click exhausted all offsets.")
+    log("  CDP Turnstile click did not yield a token - falling through to human wait.")
     return False
-
 
 def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
     """Solve reCAPTCHA v2 via Google STT audio challenge (with Whisper fallback)."""
@@ -3140,8 +3277,8 @@ def _b2b_try_auto_click_human_verification(driver, log=print) -> bool:
         pass
 
     if is_cf:
-        log("Cloudflare Turnstile detected — using pyautogui click.")
-        return _b2b_pyautogui_click_turnstile(driver, log=log)
+        log("Cloudflare Turnstile detected — CDP trusted click (screen-free).")
+        return _b2b_cdp_click_turnstile(driver, log=log)
 
     # reCAPTCHA
     for sel in ["iframe[src*='recaptcha/api2/anchor']",
@@ -3199,7 +3336,32 @@ def _b2b_wait_for_human_verification_clear(driver, stop_event=None, timeout: int
             time.sleep(5)
             if not _b2b_is_human_verification_page(driver):
                 return True
-    log("Verification did not clear after 3 cycles.")
+    log("Human verification did not clear automatically.")
+    # -- Grace period: beep + wait for a manual solve instead of failing fast --
+    # The automation may run on a second screen while the user works elsewhere;
+    # give them a chance to solve the challenge by hand before giving up.
+    try:
+        import winsound
+        for _b in range(3):
+            winsound.Beep(1200, 300)
+            time.sleep(0.25)
+        log("  Beeped 3x - waiting up to 120s for a manual solve...")
+    except Exception:
+        log("  Waiting up to 120s for a manual solve...")
+    _cleared_manually = False
+    for _g in range(60):  # 60 x 2s = 120s
+        if stop_event is not None and stop_event.is_set():
+            return False
+        time.sleep(2)
+        if not _b2b_is_human_verification_page(driver):
+            _cleared_manually = True
+            break
+        if _g in (7, 22, 37, 52):
+            log("  Still waiting for manual solve...")
+    if _cleared_manually:
+        log("  Verification cleared manually. Continuing.")
+        return True
+    log("  No manual solve within 120s. Stopping this store.")
     return False
 
 
