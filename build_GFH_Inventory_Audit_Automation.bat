@@ -99,6 +99,13 @@ if exist "dist\GFH_Inventory_Audit_Automation.exe" (
 )
 
 echo.
+REM -- Explorer icon cache refresh ----------------------------------------------
+REM  Windows caches exe icons per path; after a rebuild Explorer often keeps
+REM  showing the old/blank icon until the cache is refreshed.
+echo    Refreshing Explorer icon cache...
+%SystemRoot%\System32\ie4uinit.exe -show >nul 2>&1
+
+echo.
 echo  ============================================================
 echo   Done: GFH_Inventory_Audit_Automation.exe  (source commit !BUILD_COMMIT!)
 echo  ============================================================
