@@ -4,14 +4,14 @@ _year = _dt.date.today().year
 
 SPEC_DOC = f"""PyInstaller spec
 Developed by www.3SVerse.com \u00a9 {_year}
-Build command: pyinstaller GFH_Inventory_Audit_Automation.spec
+Build command: pyinstaller GFH_Audit_Automation.spec
 """
 
 
 block_cipher = None
 
 a = Analysis(
-    ['GFH_Inventory_Audit_Automation.py'],
+    ['GFH_Audit_Automation.py'],
     pathex=['.'],
     binaries=[],
     datas=[
@@ -105,7 +105,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="GFH_Inventory_Audit_Automation",
+    name="GFH_Audit_Automation",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

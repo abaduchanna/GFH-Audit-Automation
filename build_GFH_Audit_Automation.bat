@@ -1,15 +1,15 @@
 @echo off
 setlocal enabledelayedexpansion
-title Build GFH_Inventory_Audit_Automation
+title Build GFH_Audit_Automation
 
 set "SRCDIR=C:\Users\AbadUmairChanna\Downloads\GitHub\GFH-Inventory-Audit"
 set "OUTDIR=C:\Users\AbadUmairChanna\Downloads\GitHub"
 set "REPOURL=https://github.com/abaduchanna/GFH-Inventory-Audit.git"
-set "WORKBASE=%TEMP%\pyi_build\GFH_Inventory_Audit_Automation"
+set "WORKBASE=%TEMP%\pyi_build\GFH_Audit_Automation"
 
 echo.
 echo  ============================================================
-echo   Building: GFH_Inventory_Audit_Automation.exe
+echo   Building: GFH_Audit_Automation.exe
 echo  ============================================================
 echo.
 
@@ -85,28 +85,28 @@ if exist "requirements.txt" (
 )
 
 REM Build
-echo    Building GFH_Inventory_Audit_Automation.spec...
-python -m PyInstaller "GFH_Inventory_Audit_Automation.spec" --noconfirm --clean --workpath "%WORKBASE%" 2>&1
+echo    Building GFH_Audit_Automation.spec...
+python -m PyInstaller "GFH_Audit_Automation.spec" --noconfirm --clean --workpath "%WORKBASE%" 2>&1
 
 if errorlevel 1 (
-    echo    FAILED: GFH_Inventory_Audit_Automation
+    echo    FAILED: GFH_Audit_Automation
     pause
     exit /b 1
 )
 
-echo    SUCCESS: GFH_Inventory_Audit_Automation
+echo    SUCCESS: GFH_Audit_Automation
 
 REM Copy .exe to output
-if exist "dist\GFH_Inventory_Audit_Automation.exe" (
+if exist "dist\GFH_Audit_Automation.exe" (
     if not exist "%OUTDIR%" mkdir "%OUTDIR%"
-    copy /Y "dist\GFH_Inventory_Audit_Automation.exe" "%OUTDIR%\GFH_Inventory_Audit_Automation.exe" >nul
+    copy /Y "dist\GFH_Audit_Automation.exe" "%OUTDIR%\GFH_Audit_Automation.exe" >nul
     if errorlevel 1 (
-        echo    WARNING: could not overwrite GFH_Inventory_Audit_Automation.exe - close the running exe and rebuild.
+        echo    WARNING: could not overwrite GFH_Audit_Automation.exe - close the running exe and rebuild.
     ) else (
-        echo    Collected: %OUTDIR%\GFH_Inventory_Audit_Automation.exe
+        echo    Collected: %OUTDIR%\GFH_Audit_Automation.exe
     )
 ) else (
-    echo    WARNING: dist\GFH_Inventory_Audit_Automation.exe not found
+    echo    WARNING: dist\GFH_Audit_Automation.exe not found
 )
 
 echo.
@@ -118,7 +118,7 @@ echo    Refreshing Explorer icon cache...
 
 echo.
 echo  ============================================================
-echo   Done: GFH_Inventory_Audit_Automation.exe  (source commit !BUILD_COMMIT!)
+echo   Done: GFH_Audit_Automation.exe  (source commit !BUILD_COMMIT!)
 echo  ============================================================
 echo.
 pause

@@ -16,7 +16,7 @@ import os
 import re
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SCRIPT = os.path.join(ROOT, "GFH_Inventory_Audit_Automation.py")
+SCRIPT = os.path.join(ROOT, "GFH_Audit_Automation.py")
 
 HELPERS = (
     "_b2b_click_button",

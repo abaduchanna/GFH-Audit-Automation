@@ -19,7 +19,7 @@ import os
 import textwrap
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SCRIPT = os.path.join(ROOT, "GFH_Inventory_Audit_Automation.py")
+SCRIPT = os.path.join(ROOT, "GFH_Audit_Automation.py")
 
 with open(SCRIPT, encoding="utf-8") as _f:
     SRC = _f.read()
@@ -110,7 +110,7 @@ def test_ocr_entry_installs_then_runs():
 def test_pytesseract_shipped_in_requirements_and_spec():
     req = open(os.path.join(ROOT, "requirements.txt"), encoding="utf-8").read()
     assert "pytesseract" in req
-    spec = open(os.path.join(ROOT, "GFH_Inventory_Audit_Automation.spec"), encoding="utf-8").read()
+    spec = open(os.path.join(ROOT, "GFH_Audit_Automation.spec"), encoding="utf-8").read()
     assert "'pytesseract'," in spec
 
 

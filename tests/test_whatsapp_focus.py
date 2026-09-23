@@ -16,7 +16,7 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APP_FILES = [
-    REPO / "GFH_Inventory_Audit_Automation.py",
+    REPO / "GFH_Audit_Automation.py",
 ]
 
 
