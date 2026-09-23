@@ -2824,6 +2824,103 @@ def _b2b_is_human_verification_page(driver) -> bool:
         return False
 
 
+def _cdp_trusted_click(driver, vp_x, vp_y, log=print):
+    """One trusted left-click at VIEWPORT coords via CDP Input events.
+
+    Screen-free: no OS cursor movement, no focus change - works while the
+    Edge window sits on any monitor or behind other windows (it just must
+    not be minimized). The events are isTrusted=true, which is what Google
+    reCAPTCHA now requires (a JS .click() is isTrusted=false and ignored).
+
+    Idea ref: chrome-devtools-mcp issue #1826."""
+    def _dispatch(etype, buttons, count):
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": etype,
+            "x": float(vp_x),
+            "y": float(vp_y),
+            "button": "left",
+            "buttons": buttons,
+            "clickCount": count,
+        })
+
+    try:
+        _dispatch("mouseMoved", 0, 0)
+        time.sleep(0.06)
+        _dispatch("mousePressed", 1, 1)
+        time.sleep(0.09)
+        _dispatch("mouseReleased", 0, 1)
+        return True
+    except Exception as exc:
+        log(f"CDP trusted click failed: {exc}")
+        return False
+
+
+def _cdp_click_iframe_checkbox(driver, iframe_el, offset_x=28, log=print):
+    """Trusted CDP click on the checkbox inside a cross-origin challenge
+    iframe (reCAPTCHA anchor / Turnstile). The click point is computed
+    from the iframe's viewport rect + offset, so it never needs the
+    screen, the mouse, or JS. Returns False when it could not fire so
+    the caller can fall back to the legacy clickers."""
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", iframe_el)
+        time.sleep(0.4)
+        rect = driver.execute_script(
+            "const r = arguments[0].getBoundingClientRect();"
+            "return {left: r.left, top: r.top, width: r.width,"
+            "        height: r.height};", iframe_el)
+        if not rect or not rect.get("width"):
+            log("Challenge iframe has zero size - not rendered yet.")
+            return False
+        x = rect["left"] + offset_x
+        y = rect["top"] + rect["height"] / 2.0
+        log(f"CDP trusted click at viewport ({x:.0f},{y:.0f}) "
+            f"(iframe {rect['width']:.0f}x{rect['height']:.0f}).")
+        return _cdp_trusted_click(driver, x, y, log=log)
+    except Exception as exc:
+        log(f"CDP iframe checkbox click error: {exc}")
+        return False
+
+
+def _discover_devtools_port(log=print):
+    """Zero-config CDP port discovery (chrome-devtools-mcp#1826).
+    Chrome/Edge write DevToolsActivePort (line 1 = port) whenever remote
+    debugging is on - including the chrome://inspect remote-debugging
+    toggle on the user's normal browser. Returns the first port that
+    answers, or None."""
+    candidates = []
+    la = os.environ.get("LOCALAPPDATA")
+    if la:
+        candidates += [
+            os.path.join(la, "Microsoft", "Edge", "User Data",
+                         "DevToolsActivePort"),
+            os.path.join(la, "Google", "Chrome", "User Data",
+                         "DevToolsActivePort"),
+        ]
+    try:
+        candidates.append(os.path.join(GFH_AUTOMATION_PROFILE_DIR,
+                                       "DevToolsActivePort"))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8",
+                      errors="ignore") as fh:
+                port = int((fh.readline() or "").strip())
+        except Exception:
+            continue
+        if not 0 < port < 65536:
+            continue
+        try:
+            with socket.create_connection(("127.0.0.1", port),
+                                          timeout=1):
+                log(f"CDP port {port} discovered via {path}")
+                return port
+        except Exception:
+            continue
+    return None
+
+
 def _b2b_cdp_click_turnstile(driver, log=print) -> bool:
     """
     Solve the Cloudflare Turnstile widget using a CDP trusted click.
@@ -3109,15 +3206,32 @@ def _b2b_try_solve_recaptcha(driver, log=print) -> bool:
             log("  reCAPTCHA anchor iframe not found.")
             return False
 
-        driver.switch_to.frame(anchor)
+        _cb_trusted = False
         try:
-            cb = driver.find_element(By.ID, "recaptcha-anchor")
-            if driver.execute_script("return arguments[0].getAttribute('aria-checked');", cb) != "true":
-                cb.click()
-                log("  reCAPTCHA checkbox clicked.")
+            # TRUSTED click on the checkbox, straight through the anchor
+            # iframe (screen-free). Google ignores JS .click() events
+            # (isTrusted=false), so this is tried BEFORE the legacy
+            # element-click path below.
+            _cb_trusted = _cdp_click_iframe_checkbox(driver, anchor,
+                                                     offset_x=28, log=log)
+            if _cb_trusted:
+                log("  reCAPTCHA checkbox clicked (CDP trusted - screen-free).")
                 time.sleep(2)
-        except Exception:
-            pass
+        except Exception as _cdp_exc:
+            log(f"  CDP trusted click unavailable ({_cdp_exc}) - "
+                f"falling back to the element click.")
+        if not _cb_trusted:
+            driver.switch_to.frame(anchor)
+            try:
+                cb = driver.find_element(By.ID, "recaptcha-anchor")
+                if driver.execute_script(
+                        "return arguments[0].getAttribute('aria-checked');",
+                        cb) != "true":
+                    cb.click()
+                    log("  reCAPTCHA checkbox clicked.")
+                    time.sleep(2)
+            except Exception:
+                pass
         driver.switch_to.default_content()
         time.sleep(1.5)
 
@@ -4287,6 +4401,16 @@ def _edge_debug_driver(port: int = EDGE_DEBUG_PORT):
     """Return a Selenium driver attached to the already-running Edge profile at port."""
     from selenium import webdriver
     from selenium.webdriver.edge.options import Options as EdgeOptions
+    try:
+        if not _is_edge_port_open(port):
+            # requested port closed - zero-config discovery from
+            # DevToolsActivePort files (chrome://inspect remote debugging;
+            # idea: chrome-devtools-mcp#1826)
+            _disc = _discover_devtools_port()
+            if _disc:
+                port = _disc
+    except Exception:
+        pass
     opts = EdgeOptions()
     opts.add_experimental_option("debuggerAddress", f"127.0.0.1:{port}")
     return webdriver.Edge(options=opts)
