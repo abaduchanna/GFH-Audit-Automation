@@ -5177,7 +5177,7 @@ class B2BSoftScraper:
                 time.sleep(0.5)
             raise RuntimeError(f"B2B field ({label}) not visible after {timeout}s.")
 
-        # ── Step 3: Username + Password — ported from vidapay-extractor
+        # ── Step 3: Username + Password — ported from VidaPay_Incentive_Extractor
         # login_store: multi-strategy field location (the SSO sign-in page
         # may not use #Username/#Password ids), submit via text-matched
         # button (Next / Sign In / Log in — force-enabled before clicking,
@@ -5206,7 +5206,7 @@ class B2BSoftScraper:
             self.log("Password entered.")
 
         def _submit_credentials() -> bool:
-            # Same button-matching chain as vidapay-extractor: the SSO
+            # Same button-matching chain as VidaPay_Incentive_Extractor: the SSO
             # sign-in button is force-enabled and clicked via JS (native
             # click first, MouseEvent fallback). "Next" first — that is the
             # button the SSO sign-in page actually shows. Waits are short:
