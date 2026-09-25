@@ -2824,6 +2824,387 @@ def _b2b_is_human_verification_page(driver) -> bool:
         return False
 
 
+# >>> MOUSE-FREE v2 PATCH START >>>
+# =============================================================
+# MOUSE-FREE CHALLENGE CLICK v2 + HUMAN TYPING  (injected patch)
+#
+# The previous trusted click was dispatched on the PAGE DevTools session.
+# Cloudflare's Turnstile iframe is a cross-origin, out-of-process frame
+# (OOPIF) and page-session input events are not reliably routed into it -
+# the click dispatched "successfully" while the checkbox never registered.
+#
+# This patch attaches directly to the CHALLENGE FRAME's own DevTools target
+# and dispatches the humanized click inside the frame's own coordinate
+# space, where it is always trusted and always lands.
+#
+# Result: no OS mouse movement, no window focus, no foreground needed.
+# You keep working on the PC while the bot runs.
+# =============================================================
+ALLOW_REAL_MOUSE_FALLBACK = False   # keep False: your physical mouse is NEVER touched
+
+
+def _human_send_keys(element, text):
+    """Per-character typing with randomized inter-key delays.
+    Whole-string send_keys is a paste-burst fingerprint (every keystroke
+    lands in one instant event burst)."""
+    import random as _rnd
+    try:
+        try:
+            element.clear()
+        except Exception:
+            pass
+        time.sleep(_rnd.uniform(0.2, 0.5))
+        for _ch in str(text):
+            element.send_keys(_ch)
+            _pause = _rnd.uniform(0.05, 0.16)
+            if _rnd.random() < 0.12:
+                _pause = _rnd.uniform(0.2, 0.45)
+            time.sleep(_pause)
+        return True
+    except Exception:
+        try:
+            element.send_keys(text)
+        except Exception:
+            pass
+        return False
+
+
+def _mpf_turnstile_token_ok(driver):
+    """True when a Turnstile response token exists in the main DOM."""
+    try:
+        return bool(driver.execute_script(
+            "const i = document.querySelector('[name=\"cf-turnstile-response\"]');"
+            "return !!(i && i.value);"))
+    except Exception:
+        return False
+
+
+def _mpf_http_json(url, timeout=5):
+    import json as _json
+    from urllib.request import urlopen as _urlopen
+    with _urlopen(url, timeout=timeout) as _resp:
+        return _json.loads(_resp.read().decode("utf-8", "ignore"))
+
+
+def _mpf_cdp_call(ws, method, params=None, session_id=None, timeout=8,
+                  _state={"id": 0}):
+    """One CDP command over the raw browser websocket. Returns the response
+    message (dict) or None on timeout/error."""
+    import json as _json
+    import time as _time
+    _state["id"] = _state.get("id", 0) + 1
+    mid = _state["id"]
+    payload = {"id": mid, "method": method, "params": params or {}}
+    if session_id:
+        payload["sessionId"] = session_id
+    try:
+        ws.settimeout(timeout)
+        ws.send(_json.dumps(payload))
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            raw = ws.recv()
+            if not raw:
+                continue
+            msg = _json.loads(raw)
+            if msg.get("id") == mid:
+                return msg
+        return None
+    except Exception:
+        return None
+
+
+def _mpf_browser_endpoint(driver, log=print):
+    """Locate the browser-level DevTools HTTP endpoint for THIS driver."""
+    # 1. Selenium capability - the exact browser behind this driver
+    try:
+        da = ((driver.capabilities or {}).get("goog:chromeOptions")
+              or {}).get("debuggerAddress") or ""
+        host, _, port = da.partition(":")
+        if port and port != "0":
+            return f"http://127.0.0.1:{int(port)}"
+    except Exception:
+        pass
+    # 2. DevToolsActivePort files (Edge / Chrome / automation profile)
+    import os as _os
+    candidates = []
+    la = _os.environ.get("LOCALAPPDATA")
+    if la:
+        candidates += [
+            _os.path.join(la, "Microsoft", "Edge", "User Data",
+                          "DevToolsActivePort"),
+            _os.path.join(la, "Google", "Chrome", "User Data",
+                          "DevToolsActivePort"),
+        ]
+    try:
+        candidates.append(_os.path.join(AUTOMATION_PROFILE_DIR,
+                                        "DevToolsActivePort"))
+    except Exception:
+        pass
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                port = int((fh.readline() or "").strip())
+            if 0 < port < 65536:
+                return f"http://127.0.0.1:{port}"
+        except Exception:
+            continue
+    # 3. this app's fixed debug port constant, if defined
+    try:
+        port = int(REMOTE_DEBUGGING_PORT)
+        if 0 < port < 65536:
+            return f"http://127.0.0.1:{port}"
+    except Exception:
+        pass
+    return None
+
+
+def _cdp_frame_checkbox_click(driver, log=print,
+                              frame_markers=("challenges.cloudflare.com",),
+                              verify=None, attempts=3):
+    """THE MOUSE-FREE SOLVER.
+    Attach to the cross-origin challenge iframe's own DevTools target and
+    click its checkbox with humanized trusted input in the FRAME's own
+    coordinate space. verify() is polled after every attempt; returns True
+    only when the challenge actually cleared."""
+    import random as _rnd
+    import time as _time
+
+    # websocket-client (auto-install once)
+    try:
+        import websocket as _ws_mod  # noqa
+    except Exception:
+        try:
+            import subprocess as _sub
+            import sys as _sys
+            _sub.run([_sys.executable, "-m", "pip", "install",
+                      "websocket-client", "--quiet",
+                      "--disable-pip-version-check"],
+                     capture_output=True, timeout=120)
+            import websocket as _ws_mod  # noqa
+        except Exception:
+            log("  [mouse-free] websocket-client unavailable - frame click skipped.")
+            return False
+
+    endpoint = _mpf_browser_endpoint(driver, log=log)
+    if not endpoint:
+        log("  [mouse-free] no DevTools endpoint - frame click skipped.")
+        return False
+
+    ws_url = None
+    try:
+        info = _mpf_http_json(endpoint + "/json/version")
+        ws_url = (info or {}).get("webSocketDebuggerUrl")
+    except Exception:
+        ws_url = None
+    if not ws_url:
+        log("  [mouse-free] DevTools websocket not reachable - frame click skipped.")
+        return False
+
+    try:
+        ws = _ws_mod.create_connection(ws_url, timeout=8, suppress_origin=True)
+    except Exception as exc:
+        log(f"  [mouse-free] websocket connect failed: {exc}")
+        return False
+
+    def _checkbox_pos(session_id):
+        """Real checkbox rect INSIDE the frame (frame coordinate space)."""
+        js = (
+            "(() => { const el = document.querySelector("
+            "\"input[type='checkbox'], [role='checkbox']\");"
+            " const r = el ? el.getBoundingClientRect() : null;"
+            " return r ? {x: r.x + Math.min(30, r.width / 2),"
+            " y: r.y + r.height / 2, w: window.innerWidth,"
+            " h: window.innerHeight} : null; })()"
+        )
+        ev = _mpf_cdp_call(ws, "Runtime.evaluate",
+                           {"expression": js, "returnByValue": True},
+                           session_id=session_id, timeout=6)
+        try:
+            return (((ev or {}).get("result") or {}).get("result") or {}).get("value")
+        except Exception:
+            return None
+
+    def _human_click_at(session_id, tx, ty, vw, vh):
+        """Curved humanized approach + press/release inside the frame."""
+        def _fire(etype, x, y, button="none", buttons=0, count=0):
+            _mpf_cdp_call(ws, "Input.dispatchMouseEvent",
+                          {"type": etype, "x": float(x), "y": float(y),
+                           "button": button, "buttons": buttons,
+                           "clickCount": count},
+                          session_id=session_id, timeout=5)
+
+        tx = min(max(float(tx), 3.0), max(4.0, vw - 3.0))
+        ty = min(max(float(ty), 3.0), max(4.0, vh - 3.0))
+        sx = _rnd.uniform(0.15, 0.6) * vw
+        sy = _rnd.uniform(0.2, 0.8) * vh
+        if abs(sx - tx) < 40 and abs(sy - ty) < 20:
+            sx = (sx + vw * 0.5) % max(4.0, vw)
+            sy = (sy + vh * 0.5) % max(4.0, vh)
+        cx = (sx + tx) / 2.0 + _rnd.uniform(-24, 24)
+        cy = (sy + ty) / 2.0 + _rnd.uniform(-14, 14)
+        steps = _rnd.randint(10, 18)
+
+        def _bez(t):
+            u = 1.0 - t
+            return (u * u * sx + 2 * u * t * cx + t * t * tx,
+                    u * u * sy + 2 * u * t * cy + t * t * ty)
+
+        _fire("mouseMoved", sx, sy)
+        _time.sleep(_rnd.uniform(0.05, 0.14))
+        for i in range(1, steps + 1):
+            t = 1 - (1 - i / steps) ** 2
+            x, y = _bez(t)
+            if i == steps:
+                x, y = tx + _rnd.uniform(-1.2, 1.2), ty + _rnd.uniform(-1.0, 1.0)
+            _fire("mouseMoved", x, y)
+            _time.sleep(_rnd.uniform(0.008, 0.026))
+        _time.sleep(_rnd.uniform(0.2, 0.55))  # hover before pressing
+        px = min(max(tx + _rnd.uniform(-0.8, 0.8), 2.0), max(3.0, vw - 2.0))
+        py = min(max(ty + _rnd.uniform(-0.8, 0.8), 2.0), max(3.0, vh - 2.0))
+        _fire("mousePressed", px, py, button="left", buttons=1, count=1)
+        _time.sleep(_rnd.uniform(0.05, 0.13))
+        _fire("mouseReleased", px, py, button="left", buttons=0, count=1)
+        return True
+
+    ok = False
+    try:
+        # the challenge frame often renders a beat after the page
+        targets = []
+        for _try in range(4):
+            res = _mpf_cdp_call(ws, "Target.getTargets", {}, timeout=6)
+            infos = ((res or {}).get("result") or {}).get("targetInfos") or []
+            targets = [t for t in infos
+                       if t.get("type") == "iframe"
+                       and any(m in (t.get("url") or "") for m in frame_markers)]
+            if targets:
+                break
+            _time.sleep(1.5)
+        if not targets:
+            log("  [mouse-free] no cross-origin challenge frame found in this tab.")
+            return False
+
+        for tgt in targets[:2]:
+            att = _mpf_cdp_call(ws, "Target.attachToTarget",
+                                {"targetId": tgt["targetId"], "flatten": True},
+                                timeout=6)
+            sid = ((att or {}).get("result") or {}).get("sessionId")
+            if not sid:
+                continue
+            _time.sleep(_rnd.uniform(0.4, 0.9))
+            for attempt in range(1, attempts + 1):
+                pos = _checkbox_pos(sid) or {"x": 28.0, "y": 32.0,
+                                             "w": 300, "h": 65}
+                _human_click_at(sid, pos["x"], pos["y"],
+                                pos.get("w", 300), pos.get("h", 65))
+                deadline = _time.time() + 8.0
+                while _time.time() < deadline:
+                    _time.sleep(0.5)
+                    if verify is not None:
+                        try:
+                            if verify():
+                                log("  [mouse-free] challenge CLEARED via "
+                                    f"frame-target click (attempt {attempt}) - "
+                                    "OS mouse never touched.")
+                                ok = True
+                                break
+                        except Exception:
+                            pass
+                if ok:
+                    break
+                log(f"  [mouse-free] frame click attempt {attempt}/{attempts} "
+                    "dispatched - challenge not confirmed yet.")
+                _time.sleep(_rnd.uniform(1.0, 2.0))
+            try:
+                _mpf_cdp_call(ws, "Target.detachFromTarget",
+                              {"sessionId": sid}, timeout=4)
+            except Exception:
+                pass
+            if ok:
+                break
+    except Exception as exc:
+        log(f"  [mouse-free] frame-target click error: {exc}")
+        ok = False
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    return ok
+# <<< MOUSE-FREE v2 PATCH END <<<
+
+
+def _human_cdp_click(driver, vp_x, vp_y, log=print, label="target"):
+    """Humanized trusted left-click at VIEWPORT coords via CDP Input events.
+
+    Why: the old single move->press->release burst at fixed 60/90ms
+    intervals is exactly the rhythm bot-fingerprinting flags, even with
+    every event isTrusted=true. A real pointer travels a curved path with
+    variable speed, jitters +-2px, hovers briefly, then presses for
+    60-150ms. This reproduces all of that while staying screen-free
+    (no OS cursor, no focus steal, any monitor, window just not minimized)."""
+    import random as _rnd
+    try:
+        vp_w = int(driver.execute_script("return window.innerWidth") or 1280)
+        vp_h = int(driver.execute_script("return window.innerHeight") or 800)
+    except Exception:
+        vp_w, vp_h = 1280, 800
+
+    def _fire(etype, x, y, button="none", buttons=0, count=0):
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": etype, "x": float(x), "y": float(y),
+            "button": button, "buttons": buttons, "clickCount": count,
+        })
+
+    try:
+        # Clamp into the viewport - clicks outside it are silent no-ops.
+        tx = min(max(float(vp_x), 2.0), vp_w - 2.0)
+        ty = min(max(float(vp_y), 2.0), vp_h - 2.0)
+
+        # Start the pointer somewhere else, like a real session would.
+        sx = _rnd.uniform(0.15, 0.85) * vp_w
+        sy = _rnd.uniform(0.15, 0.85) * vp_h
+        if abs(sx - tx) < 140 and abs(sy - ty) < 140:
+            sx = (sx + vp_w * 0.5) % vp_w
+            sy = (sy + vp_h * 0.5) % vp_h
+
+        # Quadratic Bezier control point -> natural curved approach.
+        cx = (sx + tx) / 2.0 + _rnd.uniform(-90, 90)
+        cy = (sy + ty) / 2.0 + _rnd.uniform(-70, 70)
+
+        def _bez(t):
+            u = 1.0 - t
+            return (u * u * sx + 2 * u * t * cx + t * t * tx,
+                    u * u * sy + 2 * u * t * cy + t * t * ty)
+
+        _fire("mouseMoved", sx, sy)
+        time.sleep(_rnd.uniform(0.04, 0.11))
+
+        steps = _rnd.randint(22, 38)
+        prev = (sx, sy)
+        for i in range(1, steps + 1):
+            t = 1 - (1 - i / steps) ** 2  # ease-out: fast start, slow finish
+            x, y = _bez(t)
+            if i == steps:  # land on target with a +-1.5px human jitter
+                x, y = tx + _rnd.uniform(-1.5, 1.5), ty + _rnd.uniform(-1.5, 1.5)
+            if abs(x - prev[0]) < 0.5 and abs(y - prev[1]) < 0.5:
+                continue
+            _fire("mouseMoved", x, y)
+            time.sleep(_rnd.uniform(0.006, 0.022))
+            prev = (x, y)
+
+        time.sleep(_rnd.uniform(0.25, 0.7))  # hover before pressing
+
+        px = min(max(tx + _rnd.uniform(-1.0, 1.0), 1.0), vp_w - 1.0)
+        py = min(max(ty + _rnd.uniform(-1.0, 1.0), 1.0), vp_h - 1.0)
+        _fire("mousePressed", px, py, button="left", buttons=1, count=1)
+        time.sleep(_rnd.uniform(0.06, 0.15))  # real press duration
+        _fire("mouseReleased", px, py, button="left", buttons=0, count=1)
+        return True
+    except Exception as exc:
+        log(f"CDP trusted click failed ({label}): {exc}")
+        return False
+
+
 def _cdp_trusted_click(driver, vp_x, vp_y, log=print):
     """One trusted left-click at VIEWPORT coords via CDP Input events.
 
@@ -2833,26 +3214,64 @@ def _cdp_trusted_click(driver, vp_x, vp_y, log=print):
     reCAPTCHA now requires (a JS .click() is isTrusted=false and ignored).
 
     Idea ref: chrome-devtools-mcp issue #1826."""
-    def _dispatch(etype, buttons, count):
-        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-            "type": etype,
-            "x": float(vp_x),
-            "y": float(vp_y),
-            "button": "left",
-            "buttons": buttons,
-            "clickCount": count,
-        })
+    return _human_cdp_click(driver, vp_x, vp_y, log=log,
+                            label="trusted click")
 
-    try:
-        _dispatch("mouseMoved", 0, 0)
-        time.sleep(0.06)
-        _dispatch("mousePressed", 1, 1)
-        time.sleep(0.09)
-        _dispatch("mouseReleased", 0, 1)
-        return True
-    except Exception as exc:
-        log(f"CDP trusted click failed: {exc}")
-        return False
+
+def _cdp_click_registered(driver, log=print):
+    """True when the challenge reacted to the last click. Signals, checked
+    for up to ~5s (challenge frames render late):
+      1. reCAPTCHA anchor checkbox aria-checked == "true" (solved outright)
+      2. a visible reCAPTCHA challenge frame (bframe) - click registered,
+         Google opened the image/audio challenge (caller keeps solving)
+      3. a Turnstile response input carrying a token (Turnstile solved)
+    """
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            bf = driver.find_element(
+                By.CSS_SELECTOR,
+                "iframe[src*='recaptcha/api2/bframe'],"
+                "iframe[src*='recaptcha/enterprise/bframe'],"
+                "iframe[title*='recaptcha challenge'],"
+                "iframe[title*='challenge expires']")
+            if bf.is_displayed():
+                log("  challenge frame opened - click registered.")
+                return True
+        except Exception:
+            pass
+        try:
+            if driver.execute_script(
+                    "const i = document.querySelector("
+                    "'[name=\"cf-turnstile-response\"]');"
+                    "return !!(i && i.value);"):
+                return True
+        except Exception:
+            pass
+        try:
+            anchor = driver.find_element(
+                By.CSS_SELECTOR,
+                "iframe[src*='recaptcha/api2/anchor'],"
+                "iframe[src*='recaptcha/enterprise/anchor'],"
+                "iframe[title*='recaptcha'],"
+                "iframe[title*='not a robot']")
+            driver.switch_to.default_content()
+            driver.switch_to.frame(anchor)
+            checked = driver.execute_script(
+                "const el = document.getElementById('recaptcha-anchor');"
+                "return el ? el.getAttribute('aria-checked') : null;")
+            if checked == "true":
+                driver.switch_to.default_content()
+                return True
+        except Exception:
+            pass
+        finally:
+            try:
+                driver.switch_to.default_content()
+            except Exception:
+                pass
+    return False
 
 
 def _cdp_click_iframe_checkbox(driver, iframe_el, offset_x=28, log=print):
@@ -2876,7 +3295,25 @@ def _cdp_click_iframe_checkbox(driver, iframe_el, offset_x=28, log=print):
         y = rect["top"] + rect["height"] / 2.0
         log(f"CDP trusted click at viewport ({x:.0f},{y:.0f}) "
             f"(iframe {rect['width']:.0f}x{rect['height']:.0f}).")
-        return _cdp_trusted_click(driver, x, y, log=log)
+
+        # HUMANIZED + VERIFIED: dispatch up to 3 humanized clicks and after
+        # each one CHECK that the challenge actually reacted (checkbox
+        # aria-checked flipped, challenge frame opened, or a Turnstile
+        # token appeared). The old single blind click could dispatch
+        # "successfully" and still be ignored by Google.
+        import random as _rnd
+        for attempt in range(3):
+            if attempt:
+                x = rect["left"] + offset_x + _rnd.uniform(-3, 3)
+                y = rect["top"] + rect["height"] / 2.0 + _rnd.uniform(-2, 2)
+                time.sleep(_rnd.uniform(0.8, 1.6))
+            if not _cdp_trusted_click(driver, x, y, log=log):
+                continue
+            if _cdp_click_registered(driver, log=log):
+                return True
+            log(f"  trusted click {attempt + 1}/3 dispatched but the "
+                f"checkbox did not register - retrying humanized.")
+        return False
     except Exception as exc:
         log(f"CDP iframe checkbox click error: {exc}")
         return False
@@ -2972,29 +3409,9 @@ def _b2b_cdp_click_turnstile(driver, log=print) -> bool:
             return False
 
     def _cdp_click(x, y):
-        """Trusted click at viewport (x, y) via CDP input events."""
-        try:
-            # Approach movement — pointer trajectory is one of the signals
-            steps = [(x - 60, y - 45), (x - 25, y - 15), (x, y)]
-            for sx, sy in steps:
-                driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                    "type": "mouseMoved", "x": int(sx), "y": int(sy),
-                    "button": "none", "buttons": 0,
-                })
-                time.sleep(0.06)
-            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                "type": "mousePressed", "x": int(x), "y": int(y),
-                "button": "left", "buttons": 1, "clickCount": 1,
-            })
-            time.sleep(0.08)
-            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
-                "type": "mouseReleased", "x": int(x), "y": int(y),
-                "button": "left", "buttons": 0, "clickCount": 1,
-            })
-            return True
-        except Exception as e:
-            log(f"  CDP click error: {e}")
-            return False
+        """Humanized trusted click at viewport (x, y) via CDP input
+        events (Bezier approach + jitter + real press timing)."""
+        return _human_cdp_click(driver, x, y, log=log, label="turnstile")
 
     def _actions_click(el, x_off, w):
         """Fallback trusted click via Selenium ActionChains (also CDP-level,
@@ -3015,6 +3432,19 @@ def _b2b_cdp_click_turnstile(driver, log=print) -> bool:
         return True
 
     time.sleep(2.0)  # let the widget finish rendering
+
+    # -- 0.5 MOUSE-FREE frame-target click: attach to the cross-origin
+    #        Turnstile iframe's own DevTools target and click INSIDE it
+    #        (page-session input does not reliably reach OOPIF frames).
+    #        No OS mouse, no focus, works while the PC is being used.
+    try:
+        if _cdp_frame_checkbox_click(
+                driver, log=log,
+                frame_markers=("challenges.cloudflare.com",),
+                verify=lambda: bool(_token())):
+            return True
+    except Exception:
+        pass
 
     # -- 1. Locate the widget box by geometry (closed-shadow safe) ------------
     rect = None
@@ -3050,9 +3480,8 @@ def _b2b_cdp_click_turnstile(driver, log=print) -> bool:
                 return null;
             """)
             if rect:
-                log(f"  Turnstile widget located (tick {tick+1}/10): "
-                    f"{int(rect['width'])}x{int(rect['height'])}px "
-                    f"at viewport ({int(rect['left'])},{int(rect['top'])}).")
+                log(f"  Turnstile widget located: "
+                    f"{int(rect['width'])}x{int(rect['height'])}px.")
                 break
             # Bail out early when this is clearly NOT a Turnstile page, so the
             # reCAPTCHA branch is not starved.
@@ -4619,7 +5048,20 @@ class B2BSoftScraper:
                     element.send_keys(_K.BACK_SPACE * (len(existing) + 2))
             except Exception:
                 pass
-            element.send_keys(text)
+            # HUMAN TYPING: char-by-char with randomized inter-key delays
+            # (45-160ms, occasional 200-420ms hesitations) instead of an
+            # instant paste-burst of the whole string.
+            try:
+                import random as _rnd
+                time.sleep(_rnd.uniform(0.25, 0.7))
+                for _ch in str(text):
+                    element.send_keys(_ch)
+                    _pause = _rnd.uniform(0.045, 0.16)
+                    if _rnd.random() < 0.12:
+                        _pause = _rnd.uniform(0.2, 0.42)
+                    time.sleep(_pause)
+            except Exception:
+                element.send_keys(text)
 
         def _js_click(element):
             try:
