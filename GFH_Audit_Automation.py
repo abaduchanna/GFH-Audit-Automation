@@ -3205,6 +3205,44 @@ def _human_cdp_click(driver, vp_x, vp_y, log=print, label="target"):
         return False
 
 
+# >>> HUMAN-ELEMENT-CLICK v2 PATCH START >>>
+def _human_click_element(driver, element, log=print, label="button"):
+    """Humanized trusted click on a Selenium element (MAIN document):
+    scroll into view, aim at the element centre, dispatch the humanized
+    CDP click (same engine as the challenge checkbox - curved approach,
+    hover, real press timing, isTrusted=true). Falls back to the
+    element's own .click() when the element lives inside a cross-origin
+    frame (Selenium routes those correctly) or the CDP path fails."""
+    try:
+        in_top = driver.execute_script("return window.top === window.self;")
+    except Exception:
+        in_top = True
+    if in_top:
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", element)
+            time.sleep(0.3)
+            r = driver.execute_script(
+                "const r = arguments[0].getBoundingClientRect();"
+                "return {x: r.x + r.width / 2, y: r.y + r.height / 2};",
+                element)
+            if r and r.get("x") is not None and _cdp_trusted_click(
+                    driver, r["x"], r["y"], log=log):
+                return True
+        except Exception as exc:
+            log(f"  humanized element click fallback ({label}): {exc}")
+    try:
+        element.click()
+        return True
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", element)
+            return True
+        except Exception:
+            return False
+# <<< HUMAN-ELEMENT-CLICK v2 PATCH END <<<
+
+
 def _cdp_trusted_click(driver, vp_x, vp_y, log=print):
     """One trusted left-click at VIEWPORT coords via CDP Input events.
 
@@ -4068,10 +4106,7 @@ def _b2b_click_any_next(driver, log=print) -> bool:
                 EC.element_to_be_clickable((By.XPATH, xpath))
             )
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-            try:
-                btn.click()
-            except Exception:
-                driver.execute_script("arguments[0].click();", btn)
+            _human_click_element(driver, btn, log=log, label="login-next")
             log(f"Clicked button: {btn.text.strip() or xpath}")
             return True
         except Exception:
